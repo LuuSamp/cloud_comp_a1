@@ -5,7 +5,6 @@ Tracks AWS resources created during deploy for ordered teardown.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
 
 
 @dataclass
@@ -26,6 +25,10 @@ class DeploymentState:
     task_role_arn: str | None = None
     log_group_name: str | None = None
     task_definition_family: str | None = None
+    dynamo_order_logs_table: str | None = None
+    dynamo_courier_positions_table: str | None = None
+    dynamo_order_logs_arn: str | None = None
+    dynamo_courier_positions_arn: str | None = None
     created_sg_ids: list[str] = field(default_factory=list)
 
     def note_sg(self, sg_id: str) -> None:

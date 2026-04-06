@@ -1,15 +1,31 @@
 """
-Minimal DijkFood API: health check and DB connectivity probe for ECS/ALB.
+DijkFood API: health checks plus CRUD routers per entity (RDS + DynamoDB).
 """
 
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
+import boto3
 import psycopg
+from botocore.exceptions import ClientError
 from fastapi import FastAPI
 
+from routers import courier_positions, couriers, customers, food_places, order_logs, orders
+
 app = FastAPI(title="DijkFood API")
+
+app.include_router(customers.router)
+app.include_router(food_places.router)
+app.include_router(couriers.router)
+app.include_router(orders.router)
+app.include_router(order_logs.router)
+app.include_router(courier_positions.router)
 
 
 @app.get("/health")
@@ -33,3 +49,21 @@ def db_check() -> dict[str, str]:
         with conn.cursor() as cur:
             cur.execute("SELECT 1")
     return {"db": "ok"}
+
+
+@app.get("/dynamo-check")
+def dynamo_check() -> dict[str, str]:
+    logs_table = os.environ.get("DYNAMODB_ORDER_LOGS_TABLE", "")
+    pos_table = os.environ.get("DYNAMODB_COURIER_POSITIONS_TABLE", "")
+    if not logs_table or not pos_table:
+        return {"dynamo": "skipped", "detail": "DynamoDB table env vars unset"}
+    region = os.environ.get("AWS_REGION") or os.environ.get(
+        "AWS_DEFAULT_REGION", "us-east-1"
+    )
+    ddb = boto3.client("dynamodb", region_name=region)
+    try:
+        ddb.describe_table(TableName=logs_table)
+        ddb.describe_table(TableName=pos_table)
+    except ClientError as e:
+        return {"dynamo": "error", "detail": str(e)}
+    return {"dynamo": "ok"}

@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -17,6 +19,18 @@ from tools.state import DeploymentState
 
 TAG_PROJECT = "dijkfood-a1"
 CONTAINER_PORT = 8000
+
+
+def resolve_container_cli() -> str:
+    """Return absolute path to docker or podman (DOCKER_CMD), or raise FileNotFoundError."""
+    name = (os.environ.get("DOCKER_CMD") or "docker").strip() or "docker"
+    resolved = shutil.which(name)
+    if not resolved:
+        raise FileNotFoundError(
+            f"{name!r} not found on PATH. Install Docker Engine and ensure it is on PATH, "
+            "or set DOCKER_CMD to another CLI (e.g. podman) in .env."
+        )
+    return resolved
 
 
 def _tags(suffix: str) -> list[dict[str, str]]:
@@ -101,6 +115,12 @@ def create_ecs_task_security_group(ec2, vpc_id: str, alb_sg_id: str, suffix: str
 
 
 def ensure_execution_role(iam, suffix: str, state: DeploymentState) -> str:
+    override = (os.environ.get("EXECUTION_ROLE_ARN") or "").strip()
+    if override:
+        state.execution_role_arn = override
+        print("  [IAM] Using EXECUTION_ROLE_ARN from environment (skip CreateRole)")
+        return override
+
     name = f"dijkfood-ecs-exec-{suffix}"
     trust = {
         "Version": "2012-10-17",
@@ -134,6 +154,12 @@ def ensure_execution_role(iam, suffix: str, state: DeploymentState) -> str:
 
 
 def ensure_task_role(iam, suffix: str, state: DeploymentState) -> str:
+    override = (os.environ.get("TASK_ROLE_ARN") or "").strip()
+    if override:
+        state.task_role_arn = override
+        print("  [IAM] Using TASK_ROLE_ARN from environment (skip CreateRole)")
+        return override
+
     name = f"dijkfood-ecs-task-{suffix}"
     trust = {
         "Version": "2012-10-17",
@@ -191,13 +217,14 @@ def create_ecr_repo(ecr, suffix: str, state: DeploymentState) -> str:
 
 
 def docker_login_ecr(ecr_client, region: str) -> str:
+    cli = resolve_container_cli()
     tok = ecr_client.get_authorization_token()
     data = tok["authorizationData"][0]
     raw = base64.b64decode(data["authorizationToken"]).decode()
     _user, password = raw.split(":", 1)
     registry = data["proxyEndpoint"].replace("https://", "")
     subprocess.run(
-        ["docker", "login", "--username", "AWS", "--password-stdin", registry],
+        [cli, "login", "--username", "AWS", "--password-stdin", registry],
         input=(password + "\n").encode(),
         check=True,
         capture_output=True,
@@ -213,13 +240,14 @@ def build_and_push_image(
     project_root: Path,
     image_tag: str = "latest",
 ) -> str:
+    cli = resolve_container_cli()
     ecr_client = boto3.client("ecr", region_name=region)
     registry = docker_login_ecr(ecr_client, region)
     uri = f"{account_id}.dkr.ecr.{region}.amazonaws.com/{repo_name}:{image_tag}"
     dockerfile_dir = project_root / "app"
     subprocess.run(
         [
-            "docker",
+            cli,
             "build",
             "-t",
             uri,
@@ -227,7 +255,7 @@ def build_and_push_image(
         ],
         check=True,
     )
-    subprocess.run(["docker", "push", uri], check=True)
+    subprocess.run([cli, "push", uri], check=True)
     print(f"  [ECR] Pushed {uri}")
     return uri
 
@@ -303,6 +331,8 @@ def create_ecs_service(
     db_name: str,
     db_user: str,
     db_password: str,
+    dynamo_order_logs_table: str,
+    dynamo_courier_positions_table: str,
     suffix: str,
     state: DeploymentState,
 ) -> None:
@@ -340,6 +370,16 @@ def create_ecs_service(
                     {"name": "DB_NAME", "value": db_name},
                     {"name": "DB_USER", "value": db_user},
                     {"name": "DB_PASSWORD", "value": db_password},
+                    {"name": "AWS_REGION", "value": region},
+                    {"name": "AWS_DEFAULT_REGION", "value": region},
+                    {
+                        "name": "DYNAMODB_ORDER_LOGS_TABLE",
+                        "value": dynamo_order_logs_table,
+                    },
+                    {
+                        "name": "DYNAMODB_COURIER_POSITIONS_TABLE",
+                        "value": dynamo_courier_positions_table,
+                    },
                 ],
                 "logConfiguration": {
                     "logDriver": "awslogs",
@@ -430,7 +470,6 @@ def destroy_ecs_stack(
     elbv2,
     ecr,
     logs,
-    iam,
     ec2,
     state: DeploymentState,
     rds_sg_id: str | None,
@@ -516,26 +555,6 @@ def destroy_ecs_stack(
         except ClientError:
             pass
         state.log_group_name = None
-
-    for role_attr, detach_managed in (
-        ("execution_role_arn", "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"),
-        ("task_role_arn", None),
-    ):
-        arn = getattr(state, role_attr)
-        if not arn:
-            continue
-        name = arn.split("/")[-1]
-        try:
-            if detach_managed:
-                try:
-                    iam.detach_role_policy(RoleName=name, PolicyArn=detach_managed)
-                except ClientError:
-                    pass
-            iam.delete_role(RoleName=name)
-            print(f"  [teardown] Deleted IAM role {name}")
-        except ClientError as exc:
-            print(f"  [teardown] IAM role {name}: {exc.response['Error']['Code']}")
-        setattr(state, role_attr, None)
 
     if state.ecs_task_sg_id:
         try:

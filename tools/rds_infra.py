@@ -17,7 +17,24 @@ PG_VERSION = "16"
 INSTANCE_CLASS = "db.t3.micro"
 
 
-SCHEMA_SQL = """
+# Execute in order. Enum types use DO blocks (semicolons inside); do not split this as one string.
+SCHEMA_STEPS = [
+    """DO $e$ BEGIN
+        CREATE TYPE kitchen_type_t AS ENUM ('UNSPECIFIED', 'OTHER');
+    EXCEPTION WHEN duplicate_object THEN NULL; END $e$;""",
+    """DO $e$ BEGIN
+        CREATE TYPE vehicle_type_t AS ENUM ('UNSPECIFIED', 'OTHER');
+    EXCEPTION WHEN duplicate_object THEN NULL; END $e$;""",
+    """DO $e$ BEGIN
+        CREATE TYPE courier_status_t AS ENUM (
+            'idle',
+            'in_route_to_restaurant',
+            'waiting_for_order',
+            'in_route_to_customer',
+            'waiting_for_customer'
+        );
+    EXCEPTION WHEN duplicate_object THEN NULL; END $e$;""",
+    """
 CREATE TABLE IF NOT EXISTS customers (
     customer_id   SERIAL PRIMARY KEY,
     name          VARCHAR(255) NOT NULL,
@@ -26,47 +43,40 @@ CREATE TABLE IF NOT EXISTS customers (
     address       TEXT           NOT NULL,
     lat           DOUBLE PRECISION,
     lng           DOUBLE PRECISION
-);
-
+)
+    """,
+    """
 CREATE TABLE IF NOT EXISTS food_places (
     food_place_id SERIAL PRIMARY KEY,
     name          VARCHAR(255) NOT NULL,
-    kitchen_type  VARCHAR(128) NOT NULL,
+    kitchen_type  kitchen_type_t NOT NULL DEFAULT 'UNSPECIFIED',
     address       TEXT           NOT NULL,
     lat           DOUBLE PRECISION,
     lng           DOUBLE PRECISION
-);
-
+)
+    """,
+    """
 CREATE TABLE IF NOT EXISTS couriers (
     courier_id       SERIAL PRIMARY KEY,
     name             VARCHAR(255) NOT NULL,
-    vehicle_type     VARCHAR(64)  NOT NULL,
+    vehicle_type     vehicle_type_t NOT NULL DEFAULT 'UNSPECIFIED',
     initial_address  TEXT         NOT NULL,
-    status           VARCHAR(64)  NOT NULL DEFAULT 'IDLE',
+    status           courier_status_t NOT NULL DEFAULT 'idle',
     last_position    TEXT,
     lat              DOUBLE PRECISION,
     lng              DOUBLE PRECISION
-);
-
+)
+    """,
+    """
 CREATE TABLE IF NOT EXISTS orders (
     order_id      SERIAL PRIMARY KEY,
     status        VARCHAR(64)  NOT NULL DEFAULT 'CONFIRMED',
     customer_id   INT NOT NULL REFERENCES customers(customer_id),
     food_place_id INT NOT NULL REFERENCES food_places(food_place_id),
     courier_id    INT NOT NULL REFERENCES couriers(courier_id)
-);
-
-CREATE TABLE IF NOT EXISTS order_logs (
-    order_log_id SERIAL PRIMARY KEY,
-    order_id     INT NOT NULL REFERENCES orders(order_id),
-    status       VARCHAR(64)  NOT NULL,
-    detail       TEXT,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_order_logs_order_created
-    ON order_logs (order_id, created_at);
-"""
+)
+    """,
+]
 
 
 def _tags(suffix: str) -> list[dict[str, str]]:
@@ -237,7 +247,8 @@ def run_schema_bootstrap(
             with psycopg.connect(conn_str) as conn:
                 with conn.cursor() as cur:
                     cur.execute("SELECT 1")
-                    for stmt in (s.strip() for s in SCHEMA_SQL.split(";")):
+                    for step in SCHEMA_STEPS:
+                        stmt = step.strip()
                         if stmt:
                             cur.execute(stmt)
                 conn.commit()
