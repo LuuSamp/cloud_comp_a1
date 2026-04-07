@@ -150,7 +150,7 @@ def _service_specs(project_root: Path) -> list[dict[str, object]]:
             "dockerfile": project_root / "services" / "routing" / "Dockerfile",
             "path_pattern": "/routing*",
             "cpu": "512",
-            "memory": "2048",
+            "memory": "4096",
             "desired_count": 1,
             "full_stack_env": False,
             "health_check_grace_seconds": 600,
