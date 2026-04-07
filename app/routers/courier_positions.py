@@ -31,16 +31,22 @@ class CourierPositionCreate(BaseModel):
         description="Epoch milliseconds; defaults to now if omitted",
     )
     position: str = Field(..., description="Text or JSON string")
+    lat: float = Field(..., description="Latitude (WGS84), required")
+    lon: float = Field(..., description="Longitude (WGS84), required")
 
 
 class CourierPositionUpdate(BaseModel):
     position: str
+    lat: float
+    lon: float
 
 
 class CourierPositionOut(BaseModel):
     courier_id: int
     timestamp: int
     position: str
+    lat: float
+    lon: float
 
 
 def _item_to_out(item: dict[str, Any]) -> CourierPositionOut:
@@ -49,7 +55,13 @@ def _item_to_out(item: dict[str, Any]) -> CourierPositionOut:
         courier_id=n["courierId"],
         timestamp=n["timestamp"],
         position=n["position"],
+        lat=float(n["lat"]),
+        lon=float(n["lon"]),
     )
+
+
+def _dec(v: float) -> Decimal:
+    return Decimal(str(v))
 
 
 @router.post("", response_model=CourierPositionOut, status_code=status.HTTP_201_CREATED)
@@ -60,6 +72,8 @@ def create_courier_position(body: CourierPositionCreate) -> CourierPositionOut:
         "courierId": body.courier_id,
         "timestamp": ts,
         "position": body.position,
+        "lat": _dec(body.lat),
+        "lon": _dec(body.lon),
     }
     try:
         table.put_item(
@@ -75,7 +89,11 @@ def create_courier_position(body: CourierPositionCreate) -> CourierPositionOut:
             ) from e
         raise
     return CourierPositionOut(
-        courier_id=body.courier_id, timestamp=ts, position=body.position
+        courier_id=body.courier_id,
+        timestamp=ts,
+        position=body.position,
+        lat=body.lat,
+        lon=body.lon,
     )
 
 
@@ -116,13 +134,19 @@ def update_courier_position(
     try:
         resp = table.update_item(
             Key={"courierId": courier_id, "timestamp": timestamp_ms},
-            UpdateExpression="SET #p = :pos",
+            UpdateExpression="SET #p = :pos, #la = :lat, #lo = :lon",
             ExpressionAttributeNames={
                 "#p": "position",
+                "#la": "lat",
+                "#lo": "lon",
                 "#c": "courierId",
                 "#ts": "timestamp",
             },
-            ExpressionAttributeValues={":pos": body.position},
+            ExpressionAttributeValues={
+                ":pos": body.position,
+                ":lat": _dec(body.lat),
+                ":lon": _dec(body.lon),
+            },
             ConditionExpression="attribute_exists(#c) AND attribute_exists(#ts)",
             ReturnValues="ALL_NEW",
         )

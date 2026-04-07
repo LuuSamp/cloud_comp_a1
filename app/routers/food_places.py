@@ -18,16 +18,16 @@ class FoodPlaceCreate(BaseModel):
         description="PostgreSQL enum kitchen_type_t, e.g. UNSPECIFIED, OTHER",
     )
     address: str
-    lat: float | None = None
-    lng: float | None = None
+    lat: float = Field(..., description="Latitude (WGS84), required")
+    lon: float = Field(..., description="Longitude (WGS84), required")
 
 
 class FoodPlaceUpdate(BaseModel):
     name: str
     kitchen_type: str
     address: str
-    lat: float | None = None
-    lng: float | None = None
+    lat: float
+    lon: float
 
 
 class FoodPlaceOut(BaseModel):
@@ -35,8 +35,8 @@ class FoodPlaceOut(BaseModel):
     name: str
     kitchen_type: str
     address: str
-    lat: float | None = None
-    lng: float | None = None
+    lat: float
+    lon: float
 
 
 @router.post("", response_model=FoodPlaceOut, status_code=status.HTTP_201_CREATED)
@@ -48,9 +48,9 @@ def create_food_place(
         try:
             cur.execute(
                 """
-                INSERT INTO food_places (name, kitchen_type, address, lat, lng)
-                VALUES (%(name)s, %(kitchen_type)s::kitchen_type_t, %(address)s, %(lat)s, %(lng)s)
-                RETURNING food_place_id, name, kitchen_type::text, address, lat, lng
+                INSERT INTO food_places (name, kitchen_type, address, lat, lon)
+                VALUES (%(name)s, %(kitchen_type)s::kitchen_type_t, %(address)s, %(lat)s, %(lon)s)
+                RETURNING food_place_id, name, kitchen_type::text, address, lat, lon
                 """,
                 body.model_dump(),
             )
@@ -73,7 +73,7 @@ def list_food_places(
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT food_place_id, name, kitchen_type::text AS kitchen_type, address, lat, lng
+            SELECT food_place_id, name, kitchen_type::text AS kitchen_type, address, lat, lon
             FROM food_places
             ORDER BY food_place_id
             OFFSET %(skip)s LIMIT %(limit)s
@@ -92,7 +92,7 @@ def get_food_place(
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT food_place_id, name, kitchen_type::text AS kitchen_type, address, lat, lng
+            SELECT food_place_id, name, kitchen_type::text AS kitchen_type, address, lat, lon
             FROM food_places WHERE food_place_id = %(id)s
             """,
             {"id": food_place_id},
@@ -118,9 +118,9 @@ def replace_food_place(
                     kitchen_type = %(kitchen_type)s::kitchen_type_t,
                     address = %(address)s,
                     lat = %(lat)s,
-                    lng = %(lng)s
+                    lon = %(lon)s
                 WHERE food_place_id = %(food_place_id)s
-                RETURNING food_place_id, name, kitchen_type::text, address, lat, lng
+                RETURNING food_place_id, name, kitchen_type::text, address, lat, lon
                 """,
                 {**body.model_dump(), "food_place_id": food_place_id},
             )

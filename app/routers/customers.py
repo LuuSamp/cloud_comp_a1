@@ -16,8 +16,8 @@ class CustomerCreate(BaseModel):
     email: str
     phone: str
     address: str
-    lat: float | None = None
-    lng: float | None = None
+    lat: float = Field(..., description="Latitude (WGS84), required")
+    lon: float = Field(..., description="Longitude (WGS84), required")
 
 
 class CustomerUpdate(BaseModel):
@@ -25,8 +25,8 @@ class CustomerUpdate(BaseModel):
     email: str
     phone: str
     address: str
-    lat: float | None = None
-    lng: float | None = None
+    lat: float
+    lon: float
 
 
 class CustomerOut(BaseModel):
@@ -35,8 +35,8 @@ class CustomerOut(BaseModel):
     email: str
     phone: str
     address: str
-    lat: float | None = None
-    lng: float | None = None
+    lat: float
+    lon: float
 
 
 @router.post("", response_model=CustomerOut, status_code=status.HTTP_201_CREATED)
@@ -48,9 +48,9 @@ def create_customer(
         try:
             cur.execute(
                 """
-                INSERT INTO customers (name, email, phone, address, lat, lng)
-                VALUES (%(name)s, %(email)s, %(phone)s, %(address)s, %(lat)s, %(lng)s)
-                RETURNING customer_id, name, email, phone, address, lat, lng
+                INSERT INTO customers (name, email, phone, address, lat, lon)
+                VALUES (%(name)s, %(email)s, %(phone)s, %(address)s, %(lat)s, %(lon)s)
+                RETURNING customer_id, name, email, phone, address, lat, lon
                 """,
                 body.model_dump(),
             )
@@ -72,7 +72,7 @@ def list_customers(
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT customer_id, name, email, phone, address, lat, lng
+            SELECT customer_id, name, email, phone, address, lat, lon
             FROM customers
             ORDER BY customer_id
             OFFSET %(skip)s LIMIT %(limit)s
@@ -91,7 +91,7 @@ def get_customer(
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT customer_id, name, email, phone, address, lat, lng
+            SELECT customer_id, name, email, phone, address, lat, lon
             FROM customers WHERE customer_id = %(id)s
             """,
             {"id": customer_id},
@@ -118,9 +118,9 @@ def replace_customer(
                     phone = %(phone)s,
                     address = %(address)s,
                     lat = %(lat)s,
-                    lng = %(lng)s
+                    lon = %(lon)s
                 WHERE customer_id = %(customer_id)s
-                RETURNING customer_id, name, email, phone, address, lat, lng
+                RETURNING customer_id, name, email, phone, address, lat, lon
                 """,
                 {**body.model_dump(), "customer_id": customer_id},
             )

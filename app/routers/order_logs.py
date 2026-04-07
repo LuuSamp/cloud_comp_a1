@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from decimal import Decimal
 from typing import Any
-from uuid import uuid4
 
 from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
@@ -12,8 +11,6 @@ from pydantic import BaseModel, Field
 from dynamo import get_order_logs_table
 
 router = APIRouter(prefix="/order-logs", tags=["order-logs"])
-
-GSI_NAME = "orderId-timestamp-index"
 
 
 def _normalize_item(item: dict[str, Any]) -> dict[str, Any]:
@@ -27,87 +24,80 @@ def _normalize_item(item: dict[str, Any]) -> dict[str, Any]:
 
 
 class OrderLogCreate(BaseModel):
-    order_log_id: str | None = Field(
-        default=None,
-        description="If omitted, a UUID is generated",
-    )
     order_id: int
     timestamp: str = Field(
         ...,
-        description="ISO-8601 string; used as GSI sort key",
+        description="ISO-8601 string; part of composite key with order_id",
     )
-    status: str | None = None
+    order_status_id: int = Field(..., ge=1, le=6, description="FK to RDS order_statuses")
     detail: str | None = None
 
 
 class OrderLogUpdate(BaseModel):
-    order_id: int
-    timestamp: str
-    status: str | None = None
+    order_status_id: int = Field(..., ge=1, le=6)
     detail: str | None = None
 
 
 class OrderLogOut(BaseModel):
-    order_log_id: str
     order_id: int
     timestamp: str
-    status: str | None = None
+    order_status_id: int
     detail: str | None = None
 
 
 def _item_to_out(item: dict[str, Any]) -> OrderLogOut:
     n = _normalize_item(item)
     return OrderLogOut(
-        order_log_id=n["orderLogId"],
         order_id=n["orderId"],
         timestamp=n["timestamp"],
-        status=n.get("status"),
+        order_status_id=n["orderStatusId"],
         detail=n.get("detail"),
     )
+
+
+def _composite_key(order_id: int, timestamp: str) -> dict[str, Any]:
+    return {"orderId": order_id, "timestamp": timestamp}
 
 
 @router.post("", response_model=OrderLogOut, status_code=status.HTTP_201_CREATED)
 def create_order_log(body: OrderLogCreate) -> OrderLogOut:
     table = get_order_logs_table()
-    oid = body.order_log_id or str(uuid4())
     item = {
-        "orderLogId": oid,
         "orderId": body.order_id,
         "timestamp": body.timestamp,
+        "orderStatusId": body.order_status_id,
     }
-    if body.status is not None:
-        item["status"] = body.status
     if body.detail is not None:
         item["detail"] = body.detail
     try:
         table.put_item(
             Item=item,
-            ConditionExpression="attribute_not_exists(orderLogId)",
+            ConditionExpression="attribute_not_exists(orderId) AND attribute_not_exists(#ts)",
+            ExpressionAttributeNames={"#ts": "timestamp"},
         )
     except ClientError as e:
         if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
             raise HTTPException(
-                status.HTTP_409_CONFLICT, detail="order_log_id already exists"
+                status.HTTP_409_CONFLICT,
+                detail="Order log for this order_id and timestamp already exists",
             ) from e
         raise
     return OrderLogOut(
-        order_log_id=oid,
         order_id=body.order_id,
         timestamp=body.timestamp,
-        status=body.status,
+        order_status_id=body.order_status_id,
         detail=body.detail,
     )
 
 
 @router.get("", response_model=list[OrderLogOut])
 def list_order_logs(
-    order_id: int | None = Query(default=None, description="Filter by order (GSI query)"),
+    order_id: int | None = Query(default=None, description="Filter by order (table query)"),
     limit: int = Query(default=50, le=200),
 ) -> list[OrderLogOut]:
     table = get_order_logs_table()
     if order_id is not None:
         resp = table.query(
-            IndexName=GSI_NAME,
             KeyConditionExpression=Key("orderId").eq(order_id),
             Limit=limit,
             ScanIndexForward=True,
@@ -119,47 +109,46 @@ def list_order_logs(
     return [_item_to_out(i) for i in items]
 
 
-@router.get("/{order_log_id}", response_model=OrderLogOut)
-def get_order_log(order_log_id: str) -> OrderLogOut:
+@router.get("/{order_id}/{timestamp}", response_model=OrderLogOut)
+def get_order_log(order_id: int, timestamp: str) -> OrderLogOut:
     table = get_order_logs_table()
-    resp = table.get_item(Key={"orderLogId": order_log_id})
+    resp = table.get_item(Key=_composite_key(order_id, timestamp))
     item = resp.get("Item")
     if not item:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Order log not found")
     return _item_to_out(item)
 
 
-@router.put("/{order_log_id}", response_model=OrderLogOut)
-def replace_order_log(order_log_id: str, body: OrderLogUpdate) -> OrderLogOut:
+@router.put("/{order_id}/{timestamp}", response_model=OrderLogOut)
+def replace_order_log(
+    order_id: int, timestamp: str, body: OrderLogUpdate
+) -> OrderLogOut:
     table = get_order_logs_table()
-    existing = table.get_item(Key={"orderLogId": order_log_id}).get("Item")
+    key = _composite_key(order_id, timestamp)
+    existing = table.get_item(Key=key).get("Item")
     if not existing:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Order log not found")
-    table.delete_item(Key={"orderLogId": order_log_id})
     item = {
-        "orderLogId": order_log_id,
-        "orderId": body.order_id,
-        "timestamp": body.timestamp,
+        "orderId": order_id,
+        "timestamp": timestamp,
+        "orderStatusId": body.order_status_id,
     }
-    if body.status is not None:
-        item["status"] = body.status
     if body.detail is not None:
         item["detail"] = body.detail
     table.put_item(Item=item)
     return OrderLogOut(
-        order_log_id=order_log_id,
-        order_id=body.order_id,
-        timestamp=body.timestamp,
-        status=body.status,
+        order_id=order_id,
+        timestamp=timestamp,
+        order_status_id=body.order_status_id,
         detail=body.detail,
     )
 
 
-@router.delete("/{order_log_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_order_log(order_log_id: str) -> Response:
+@router.delete("/{order_id}/{timestamp}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_order_log(order_id: int, timestamp: str) -> Response:
     table = get_order_logs_table()
     resp = table.delete_item(
-        Key={"orderLogId": order_log_id},
+        Key=_composite_key(order_id, timestamp),
         ReturnValues="ALL_OLD",
     )
     if not resp.get("Attributes"):

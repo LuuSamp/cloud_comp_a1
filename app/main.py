@@ -16,16 +16,27 @@ import psycopg
 from botocore.exceptions import ClientError
 from fastapi import FastAPI
 
-from routers import courier_positions, couriers, customers, food_places, order_logs, orders
+from routers import (
+    courier_positions,
+    couriers,
+    customers,
+    food_places,
+    order_logs,
+    order_statuses,
+    orders,
+    sim_placeholders,
+)
 
 app = FastAPI(title="DijkFood API")
 
 app.include_router(customers.router)
 app.include_router(food_places.router)
 app.include_router(couriers.router)
+app.include_router(order_statuses.router)
 app.include_router(orders.router)
 app.include_router(order_logs.router)
 app.include_router(courier_positions.router)
+app.include_router(sim_placeholders.router)
 
 
 @app.get("/health")

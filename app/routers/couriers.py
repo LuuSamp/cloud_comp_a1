@@ -17,8 +17,8 @@ class CourierCreate(BaseModel):
     initial_address: str
     status: str = Field(default="idle", description="enum courier_status_t")
     last_position: str | None = None
-    lat: float | None = None
-    lng: float | None = None
+    initial_lat: float = Field(..., description="Initial latitude (WGS84), required")
+    initial_lon: float = Field(..., description="Initial longitude (WGS84), required")
 
 
 class CourierUpdate(BaseModel):
@@ -27,8 +27,8 @@ class CourierUpdate(BaseModel):
     initial_address: str
     status: str
     last_position: str | None = None
-    lat: float | None = None
-    lng: float | None = None
+    initial_lat: float
+    initial_lon: float
 
 
 class CourierOut(BaseModel):
@@ -38,8 +38,8 @@ class CourierOut(BaseModel):
     initial_address: str
     status: str
     last_position: str | None = None
-    lat: float | None = None
-    lng: float | None = None
+    initial_lat: float
+    initial_lon: float
 
 
 @router.post("", response_model=CourierOut, status_code=status.HTTP_201_CREATED)
@@ -53,17 +53,17 @@ def create_courier(
                 """
                 INSERT INTO couriers (
                     name, vehicle_type, initial_address, status,
-                    last_position, lat, lng
+                    last_position, initial_lat, initial_lon
                 )
                 VALUES (
                     %(name)s,
                     %(vehicle_type)s::vehicle_type_t,
                     %(initial_address)s,
                     %(status)s::courier_status_t,
-                    %(last_position)s, %(lat)s, %(lng)s
+                    %(last_position)s, %(initial_lat)s, %(initial_lon)s
                 )
                 RETURNING courier_id, name, vehicle_type::text, initial_address,
-                          status::text, last_position, lat, lng
+                          status::text, last_position, initial_lat, initial_lon
                 """,
                 body.model_dump(),
             )
@@ -87,7 +87,7 @@ def list_couriers(
         cur.execute(
             """
             SELECT courier_id, name, vehicle_type::text, initial_address,
-                   status::text, last_position, lat, lng
+                   status::text, last_position, initial_lat, initial_lon
             FROM couriers
             ORDER BY courier_id
             OFFSET %(skip)s LIMIT %(limit)s
@@ -107,7 +107,7 @@ def get_courier(
         cur.execute(
             """
             SELECT courier_id, name, vehicle_type::text, initial_address,
-                   status::text, last_position, lat, lng
+                   status::text, last_position, initial_lat, initial_lon
             FROM couriers WHERE courier_id = %(id)s
             """,
             {"id": courier_id},
@@ -134,11 +134,11 @@ def replace_courier(
                     initial_address = %(initial_address)s,
                     status = %(status)s::courier_status_t,
                     last_position = %(last_position)s,
-                    lat = %(lat)s,
-                    lng = %(lng)s
+                    initial_lat = %(initial_lat)s,
+                    initial_lon = %(initial_lon)s
                 WHERE courier_id = %(courier_id)s
                 RETURNING courier_id, name, vehicle_type::text, initial_address,
-                          status::text, last_position, lat, lng
+                          status::text, last_position, initial_lat, initial_lon
                 """,
                 {**body.model_dump(), "courier_id": courier_id},
             )

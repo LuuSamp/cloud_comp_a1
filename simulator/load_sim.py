@@ -12,13 +12,13 @@ import argparse
 import os
 import statistics
 import sys
-from pathlib import Path
 
-from dotenv import load_dotenv
 import threading
 import time
 import urllib.error
 import urllib.request
+
+from .env_load import load_simulator_env
 
 
 def _fetch(url: str, path: str, latencies: list[float], errors: list[str]) -> None:
@@ -91,12 +91,12 @@ def run(args: argparse.Namespace) -> int:
 
 
 def main() -> None:
-    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+    load_simulator_env()
     p = argparse.ArgumentParser(description="DijkFood HTTP load simulator")
     p.add_argument(
         "--base-url",
         default=(os.environ.get("BASE_URL") or "").strip(),
-        help="e.g. http://my-alb.us-east-1.elb.amazonaws.com (or set BASE_URL in .env)",
+        help="e.g. http://my-alb.us-east-1.elb.amazonaws.com (or BASE_URL in .env / connection.env)",
     )
     p.add_argument("--path", default="/health", help="URL path to request")
     p.add_argument("--rate", type=float, default=10.0, help="Target requests per second per worker")
@@ -104,7 +104,7 @@ def main() -> None:
     p.add_argument("--workers", type=int, default=2, help="Concurrent worker threads")
     args = p.parse_args()
     if not args.base_url:
-        p.error("Pass --base-url or set BASE_URL in project .env")
+        p.error("Pass --base-url or set BASE_URL in .env / connection.env")
     sys.exit(run(args))
 
 

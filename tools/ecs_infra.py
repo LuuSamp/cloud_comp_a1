@@ -15,7 +15,7 @@ from pathlib import Path
 import boto3
 from botocore.exceptions import ClientError
 
-from tools.state import DeploymentState
+from tools.state import DeploymentState, EcsServiceRecord
 
 TAG_PROJECT = "dijkfood-a1"
 CONTAINER_PORT = 8000
@@ -199,21 +199,18 @@ def ensure_log_group(logs, name: str) -> None:
             raise
 
 
-def create_ecr_repo(ecr, suffix: str, state: DeploymentState) -> str:
-    name = f"dijkfood-api-{suffix}"
+def ensure_ecr_repository(ecr, repository_name: str) -> None:
     try:
         ecr.create_repository(
-            repositoryName=name,
+            repositoryName=repository_name,
             imageTagMutability="MUTABLE",
             tags=[{"Key": "Project", "Value": TAG_PROJECT}],
         )
-        print(f"  [ECR] Repository {name}")
+        print(f"  [ECR] Repository {repository_name}")
     except ClientError as exc:
         if exc.response["Error"]["Code"] != "RepositoryAlreadyExistsException":
             raise
-        print(f"  [ECR] Repository {name} exists")
-    state.ecr_repo_name = name
-    return name
+        print(f"  [ECR] Repository {repository_name} exists")
 
 
 def docker_login_ecr(ecr_client, region: str) -> str:
@@ -237,21 +234,23 @@ def build_and_push_image(
     region: str,
     account_id: str,
     repo_name: str,
-    project_root: Path,
+    docker_context: Path,
+    dockerfile: Path,
     image_tag: str = "latest",
 ) -> str:
     cli = resolve_container_cli()
     ecr_client = boto3.client("ecr", region_name=region)
     registry = docker_login_ecr(ecr_client, region)
     uri = f"{account_id}.dkr.ecr.{region}.amazonaws.com/{repo_name}:{image_tag}"
-    dockerfile_dir = project_root / "app"
     subprocess.run(
         [
             cli,
             "build",
+            "-f",
+            str(dockerfile),
             "-t",
             uri,
-            str(dockerfile_dir),
+            str(docker_context),
         ],
         check=True,
     )
@@ -260,16 +259,14 @@ def build_and_push_image(
     return uri
 
 
-def create_alb(
+def create_alb_only(
     elbv2,
-    vpc_id: str,
     subnet_ids: list[str],
     alb_sg_id: str,
     suffix: str,
     state: DeploymentState,
-) -> tuple[str, str, str, str]:
+) -> tuple[str, str]:
     alb_name = f"dfalb{suffix}"[:32]
-    tg_name = f"dftg{suffix}"[:32]
     waf = elbv2.create_load_balancer(
         Name=alb_name,
         Subnets=subnet_ids,
@@ -282,7 +279,17 @@ def create_alb(
     alb_arn = waf["LoadBalancers"][0]["LoadBalancerArn"]
     dns = waf["LoadBalancers"][0]["DNSName"]
     print(f"  [ALB] {dns}")
+    state.alb_arn = alb_arn
+    return alb_arn, dns
 
+
+def create_target_group(
+    elbv2,
+    vpc_id: str,
+    suffix: str,
+    service_id: str,
+) -> str:
+    tg_name = f"dftg{suffix}-{service_id}"[:32]
     tg = elbv2.create_target_group(
         Name=tg_name,
         Protocol="HTTP",
@@ -297,63 +304,31 @@ def create_alb(
         UnhealthyThresholdCount=5,
         Tags=_tags(suffix),
     )
-    tg_arn = tg["TargetGroups"][0]["TargetGroupArn"]
-
-    listener = elbv2.create_listener(
-        LoadBalancerArn=alb_arn,
-        Protocol="HTTP",
-        Port=80,
-        DefaultActions=[{"Type": "forward", "TargetGroupArn": tg_arn}],
-    )
-    listener_arn = listener["Listeners"][0]["ListenerArn"]
-    state.alb_arn = alb_arn
-    state.listener_arn = listener_arn
-    state.target_group_arn = tg_arn
-    return alb_arn, listener_arn, tg_arn, dns
+    return tg["TargetGroups"][0]["TargetGroupArn"]
 
 
-def create_ecs_service(
+def register_fargate_task_definition(
     ecs,
     *,
-    cluster_name: str,
-    service_name: str,
     task_family: str,
     image_uri: str,
     execution_role_arn: str,
     task_role_arn: str,
     log_group: str,
     region: str,
-    subnet_ids: list[str],
-    task_sg_id: str,
-    target_group_arn: str,
-    db_host: str,
-    db_port: str,
-    db_name: str,
-    db_user: str,
-    db_password: str,
-    dynamo_order_logs_table: str,
-    dynamo_courier_positions_table: str,
-    suffix: str,
-    state: DeploymentState,
-) -> None:
-    try:
-        ecs.create_cluster(
-            clusterName=cluster_name,
-            tags=[{"key": "Project", "value": TAG_PROJECT}],
-        )
-        print(f"  [ECS] Cluster {cluster_name}")
-    except ClientError as exc:
-        if exc.response["Error"]["Code"] != "ClusterAlreadyExistsException":
-            raise
-        print(f"  [ECS] Cluster {cluster_name} exists")
-
-    container_name = "api"
+    environment: list[dict[str, str]],
+    cpu: str = "256",
+    memory: str = "512",
+    container_name: str = "api",
+    log_stream_prefix: str = "api",
+) -> str:
+    """Register a new Fargate task revision; return task definition ARN."""
     td = ecs.register_task_definition(
         family=task_family,
         networkMode="awsvpc",
         requiresCompatibilities=["FARGATE"],
-        cpu="256",
-        memory="512",
+        cpu=cpu,
+        memory=memory,
         executionRoleArn=execution_role_arn,
         taskRoleArn=task_role_arn,
         containerDefinitions=[
@@ -364,67 +339,186 @@ def create_ecs_service(
                 "portMappings": [
                     {"containerPort": CONTAINER_PORT, "protocol": "tcp"}
                 ],
-                "environment": [
-                    {"name": "DB_HOST", "value": db_host},
-                    {"name": "DB_PORT", "value": db_port},
-                    {"name": "DB_NAME", "value": db_name},
-                    {"name": "DB_USER", "value": db_user},
-                    {"name": "DB_PASSWORD", "value": db_password},
-                    {"name": "AWS_REGION", "value": region},
-                    {"name": "AWS_DEFAULT_REGION", "value": region},
-                    {
-                        "name": "DYNAMODB_ORDER_LOGS_TABLE",
-                        "value": dynamo_order_logs_table,
-                    },
-                    {
-                        "name": "DYNAMODB_COURIER_POSITIONS_TABLE",
-                        "value": dynamo_courier_positions_table,
-                    },
-                ],
+                "environment": environment,
                 "logConfiguration": {
                     "logDriver": "awslogs",
                     "options": {
                         "awslogs-group": log_group,
                         "awslogs-region": region,
-                        "awslogs-stream-prefix": "api",
+                        "awslogs-stream-prefix": log_stream_prefix,
                     },
                 },
             }
         ],
     )
-    rev = td["taskDefinition"]["taskDefinitionArn"]
-    print(f"  [ECS] Registered {rev}")
-    state.task_definition_family = task_family
+    arn = td["taskDefinition"]["taskDefinitionArn"]
+    print(f"  [ECS] Registered {arn}")
+    return arn
 
-    ecs.create_service(
-        cluster=cluster_name,
-        serviceName=service_name,
-        taskDefinition=rev,
-        desiredCount=1,
-        launchType="FARGATE",
-        networkConfiguration={
-            "awsvpcConfiguration": {
-                "subnets": subnet_ids,
-                "securityGroups": [task_sg_id],
-                "assignPublicIp": "ENABLED",
-            }
-        },
-        loadBalancers=[
-            {
-                "targetGroupArn": target_group_arn,
-                "containerName": container_name,
-                "containerPort": CONTAINER_PORT,
-            }
-        ],
-        healthCheckGracePeriodSeconds=120,
-        tags=[
-            {"key": "Project", "value": TAG_PROJECT},
-            {"key": "DeploymentId", "value": suffix},
+
+def ecs_service_exists(ecs, cluster: str, service_name: str) -> bool:
+    d = ecs.describe_services(cluster=cluster, services=[service_name])
+    for s in d.get("services") or []:
+        if s.get("serviceName") == service_name and s.get("status") != "INACTIVE":
+            return True
+    return False
+
+
+def update_ecs_service_task_definition(
+    ecs,
+    *,
+    cluster: str,
+    service: str,
+    task_definition_arn: str,
+    force_new_deployment: bool = True,
+    health_check_grace_period_seconds: int | None = None,
+) -> None:
+    kwargs: dict[str, object] = {
+        "cluster": cluster,
+        "service": service,
+        "taskDefinition": task_definition_arn,
+        "forceNewDeployment": force_new_deployment,
+    }
+    if health_check_grace_period_seconds is not None:
+        kwargs["healthCheckGracePeriodSeconds"] = health_check_grace_period_seconds
+    ecs.update_service(**kwargs)
+    print(f"  [ECS] Updated service {service} (new task definition)")
+
+
+def create_listener_and_rules(
+    elbv2,
+    *,
+    alb_arn: str,
+    default_target_group_arn: str,
+    path_forward_rules: list[tuple[int, str, str]],
+    state: DeploymentState,
+) -> str:
+    listener = elbv2.create_listener(
+        LoadBalancerArn=alb_arn,
+        Protocol="HTTP",
+        Port=80,
+        DefaultActions=[
+            {"Type": "forward", "TargetGroupArn": default_target_group_arn}
         ],
     )
-    print(f"  [ECS] Service {service_name}")
+    listener_arn = listener["Listeners"][0]["ListenerArn"]
+    for priority, path_pattern, tg_arn in path_forward_rules:
+        elbv2.create_rule(
+            ListenerArn=listener_arn,
+            Priority=priority,
+            Conditions=[
+                {"Field": "path-pattern", "Values": [path_pattern]},
+            ],
+            Actions=[{"Type": "forward", "TargetGroupArn": tg_arn}],
+        )
+        print(f"  [ALB] Rule {path_pattern} -> {tg_arn[:60]}...")
+    state.listener_arn = listener_arn
+    return listener_arn
+
+
+def create_ecs_service(
+    ecs,
+    *,
+    cluster_name: str,
+    service_name: str,
+    service_id: str,
+    task_family: str,
+    image_uri: str,
+    execution_role_arn: str,
+    task_role_arn: str,
+    log_group: str,
+    region: str,
+    subnet_ids: list[str],
+    task_sg_id: str,
+    target_group_arn: str,
+    suffix: str,
+    state: DeploymentState,
+    environment: list[dict[str, str]],
+    cpu: str = "256",
+    memory: str = "512",
+    desired_count: int = 1,
+    container_name: str = "api",
+    log_stream_prefix: str = "api",
+    create_cluster_if_needed: bool = True,
+    health_check_grace_period_seconds: int = 120,
+) -> EcsServiceRecord:
+    if create_cluster_if_needed:
+        try:
+            ecs.create_cluster(
+                clusterName=cluster_name,
+                tags=[{"key": "Project", "value": TAG_PROJECT}],
+            )
+            print(f"  [ECS] Cluster {cluster_name}")
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] != "ClusterAlreadyExistsException":
+                raise
+            print(f"  [ECS] Cluster {cluster_name} exists")
     state.cluster_name = cluster_name
-    state.service_name = service_name
+
+    rev = register_fargate_task_definition(
+        ecs,
+        task_family=task_family,
+        image_uri=image_uri,
+        execution_role_arn=execution_role_arn,
+        task_role_arn=task_role_arn,
+        log_group=log_group,
+        region=region,
+        environment=environment,
+        cpu=cpu,
+        memory=memory,
+        container_name=container_name,
+        log_stream_prefix=log_stream_prefix,
+    )
+
+    if ecs_service_exists(ecs, cluster_name, service_name):
+        print(f"  [ECS] Service {service_name} already exists; rolling new task definition")
+        update_ecs_service_task_definition(
+            ecs,
+            cluster=cluster_name,
+            service=service_name,
+            task_definition_arn=rev,
+            health_check_grace_period_seconds=health_check_grace_period_seconds,
+        )
+    else:
+        ecs.create_service(
+            cluster=cluster_name,
+            serviceName=service_name,
+            taskDefinition=rev,
+            desiredCount=desired_count,
+            launchType="FARGATE",
+            networkConfiguration={
+                "awsvpcConfiguration": {
+                    "subnets": subnet_ids,
+                    "securityGroups": [task_sg_id],
+                    "assignPublicIp": "ENABLED",
+                }
+            },
+            loadBalancers=[
+                {
+                    "targetGroupArn": target_group_arn,
+                    "containerName": container_name,
+                    "containerPort": CONTAINER_PORT,
+                }
+            ],
+            healthCheckGracePeriodSeconds=health_check_grace_period_seconds,
+            tags=[
+                {"key": "Project", "value": TAG_PROJECT},
+                {"key": "DeploymentId", "value": suffix},
+            ],
+        )
+        print(f"  [ECS] Service {service_name}")
+
+    repo_base = image_uri.split("/")[-1].rsplit(":", 1)[0]
+    record = EcsServiceRecord(
+        service_id=service_id,
+        service_name=service_name,
+        ecr_repo_name=repo_base,
+        task_definition_family=task_family,
+        target_group_arn=target_group_arn,
+        log_group_name=log_group,
+    )
+    state.ecs_services.append(record)
+    return record
 
 
 def wait_for_service_stable(ecs, cluster: str, service: str, timeout_s: int = 600) -> None:
@@ -465,6 +559,40 @@ def revoke_rds_access_from_ecs(ec2, rds_sg_id: str | None, ecs_task_sg_id: str |
         pass
 
 
+def _delete_ecs_service(ecs, cluster: str, service_name: str) -> None:
+    try:
+        ecs.update_service(
+            cluster=cluster,
+            service=service_name,
+            desiredCount=0,
+        )
+        for _ in range(24):
+            d = ecs.describe_services(cluster=cluster, services=[service_name])
+            if d["services"] and d["services"][0].get("runningCount", 0) == 0:
+                break
+            time.sleep(10)
+        ecs.delete_service(cluster=cluster, service=service_name, force=True)
+        print(f"  [teardown] Deleted ECS service {service_name}")
+    except ClientError as exc:
+        print(f"  [teardown] ECS service {service_name}: {exc.response['Error']['Code']}")
+
+
+def _delete_ecr_repo(ecr, repo_name: str) -> None:
+    try:
+        ids: list[dict[str, str]] = []
+        paginator = ecr.get_paginator("list_images")
+        for page in paginator.paginate(repositoryName=repo_name):
+            ids.extend(page.get("imageIds", []))
+        if ids:
+            for i in range(0, len(ids), 100):
+                chunk = ids[i : i + 100]
+                ecr.batch_delete_image(repositoryName=repo_name, imageIds=chunk)
+        ecr.delete_repository(repositoryName=repo_name, force=True)
+        print(f"  [teardown] Deleted ECR {repo_name}")
+    except ClientError as exc:
+        print(f"  [teardown] ECR {repo_name}: {exc.response['Error']['Code']}")
+
+
 def destroy_ecs_stack(
     ecs,
     elbv2,
@@ -476,35 +604,15 @@ def destroy_ecs_stack(
 ) -> None:
     revoke_rds_access_from_ecs(ec2, rds_sg_id, state.ecs_task_sg_id)
 
-    if state.cluster_name and state.service_name:
-        try:
-            ecs.update_service(
-                cluster=state.cluster_name,
-                service=state.service_name,
-                desiredCount=0,
-            )
-            for _ in range(24):
-                d = ecs.describe_services(
-                    cluster=state.cluster_name,
-                    services=[state.service_name],
-                )
-                if d["services"] and d["services"][0].get("runningCount", 0) == 0:
-                    break
-                time.sleep(10)
-            ecs.delete_service(
-                cluster=state.cluster_name,
-                service=state.service_name,
-                force=True,
-            )
-            print(f"  [teardown] Deleted ECS service {state.service_name}")
-        except ClientError as exc:
-            print(f"  [teardown] ECS service: {exc.response['Error']['Code']}")
-        state.service_name = None
+    records = list(state.ecs_services)
+    cluster = state.cluster_name
 
-    if state.cluster_name:
+    if cluster:
+        for rec in records:
+            _delete_ecs_service(ecs, cluster, rec.service_name)
         try:
-            ecs.delete_cluster(cluster=state.cluster_name)
-            print(f"  [teardown] Deleted cluster {state.cluster_name}")
+            ecs.delete_cluster(cluster=cluster)
+            print(f"  [teardown] Deleted cluster {cluster}")
         except ClientError as exc:
             print(f"  [teardown] Cluster: {exc.response['Error']['Code']}")
         state.cluster_name = None
@@ -524,37 +632,21 @@ def destroy_ecs_stack(
             print(f"  [teardown] ALB: {exc.response['Error']['Code']}")
         state.alb_arn = None
 
-    if state.target_group_arn:
-        try:
-            elbv2.delete_target_group(TargetGroupArn=state.target_group_arn)
-        except ClientError as exc:
-            print(f"  [teardown] TG: {exc.response['Error']['Code']}")
-        state.target_group_arn = None
+    for rec in records:
+        if rec.target_group_arn:
+            try:
+                elbv2.delete_target_group(TargetGroupArn=rec.target_group_arn)
+            except ClientError as exc:
+                print(f"  [teardown] TG: {exc.response['Error']['Code']}")
+        if rec.ecr_repo_name:
+            _delete_ecr_repo(ecr, rec.ecr_repo_name)
+        if rec.log_group_name:
+            try:
+                logs.delete_log_group(logGroupName=rec.log_group_name)
+            except ClientError:
+                pass
 
-    if state.ecr_repo_name:
-        try:
-            ids: list[dict[str, str]] = []
-            paginator = ecr.get_paginator("list_images")
-            for page in paginator.paginate(repositoryName=state.ecr_repo_name):
-                ids.extend(page.get("imageIds", []))
-            if ids:
-                for i in range(0, len(ids), 100):
-                    chunk = ids[i : i + 100]
-                    ecr.batch_delete_image(
-                        repositoryName=state.ecr_repo_name, imageIds=chunk
-                    )
-            ecr.delete_repository(repositoryName=state.ecr_repo_name, force=True)
-            print(f"  [teardown] Deleted ECR {state.ecr_repo_name}")
-        except ClientError as exc:
-            print(f"  [teardown] ECR: {exc.response['Error']['Code']}")
-        state.ecr_repo_name = None
-
-    if state.log_group_name:
-        try:
-            logs.delete_log_group(logGroupName=state.log_group_name)
-        except ClientError:
-            pass
-        state.log_group_name = None
+    state.ecs_services.clear()
 
     if state.ecs_task_sg_id:
         try:

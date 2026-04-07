@@ -1,5 +1,5 @@
 """
-DynamoDB: order logs and courier positions (ERD v2).
+DynamoDB: order logs and courier positions (ERD composite keys).
 """
 
 from __future__ import annotations
@@ -34,21 +34,13 @@ def create_dynamodb_tables(ddb, suffix: str, state: DeploymentState) -> tuple[st
     try:
         r1 = ddb.create_table(
             TableName=order_logs,
-            KeySchema=[{"AttributeName": "orderLogId", "KeyType": "HASH"}],
+            KeySchema=[
+                {"AttributeName": "orderId", "KeyType": "HASH"},
+                {"AttributeName": "timestamp", "KeyType": "RANGE"},
+            ],
             AttributeDefinitions=[
-                {"AttributeName": "orderLogId", "AttributeType": "S"},
                 {"AttributeName": "orderId", "AttributeType": "N"},
                 {"AttributeName": "timestamp", "AttributeType": "S"},
-            ],
-            GlobalSecondaryIndexes=[
-                {
-                    "IndexName": "orderId-timestamp-index",
-                    "KeySchema": [
-                        {"AttributeName": "orderId", "KeyType": "HASH"},
-                        {"AttributeName": "timestamp", "KeyType": "RANGE"},
-                    ],
-                    "Projection": {"ProjectionType": "ALL"},
-                }
             ],
             BillingMode="PAY_PER_REQUEST",
         )
@@ -61,7 +53,10 @@ def create_dynamodb_tables(ddb, suffix: str, state: DeploymentState) -> tuple[st
             raise
         d = ddb.describe_table(TableName=order_logs)
         arn1 = d["Table"]["TableArn"]
-        print(f"  [DynamoDB] Table {order_logs} exists")
+        print(
+            f"  [DynamoDB] Table {order_logs} exists "
+            "(if schema changed vs. orderId+timestamp PK, delete the table or use a new suffix)"
+        )
 
     try:
         r2 = ddb.create_table(
@@ -85,7 +80,10 @@ def create_dynamodb_tables(ddb, suffix: str, state: DeploymentState) -> tuple[st
             raise
         d = ddb.describe_table(TableName=courier_pos)
         arn2 = d["Table"]["TableArn"]
-        print(f"  [DynamoDB] Table {courier_pos} exists")
+        print(
+            f"  [DynamoDB] Table {courier_pos} exists "
+            "(if schema changed, delete the table or use a new suffix)"
+        )
 
     state.dynamo_order_logs_table = order_logs
     state.dynamo_courier_positions_table = courier_pos
