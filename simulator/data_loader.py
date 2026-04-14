@@ -5,6 +5,10 @@ Load RDS fixture data via public POST APIs (no orders).
   python -m simulator.data_loader --base-url http://<alb> [--customers 10]
 
 Writes dijkfood_sim_state.json (or --state-file) for load_test.
+
+If the state file already exists, deletes tracked customers, food_places, couriers
+(and any orders referencing them) via API before inserting, so re-runs do not
+leave stale rows or duplicate fixture conflicts.
 """
 
 from __future__ import annotations
@@ -16,10 +20,110 @@ import random
 import sys
 import uuid
 from pathlib import Path
+from typing import Any
 
 from .env_load import load_simulator_env
 from .http_client import json_load, request_json
 from .sp_coords import sample_coordinates
+
+
+def _load_state(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        print(f"[data_loader] WARN: could not parse {path}: {e}", file=sys.stderr)
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def _delete_tracked_entities(base_url: str, state: dict[str, Any]) -> None:
+    """Remove prior fixture rows so this run can POST afresh without FK conflicts."""
+    customers = {int(x) for x in (state.get("customer_ids") or []) if x is not None}
+    foods = {int(x) for x in (state.get("food_place_ids") or []) if x is not None}
+    couriers = {int(x) for x in (state.get("courier_ids") or []) if x is not None}
+    if not customers and not foods and not couriers:
+        return
+
+    print(
+        f"[data_loader] Deleting prior fixture: "
+        f"{len(customers)} customers, {len(foods)} food_places, {len(couriers)} couriers"
+    )
+
+    order_ids: list[int] = []
+    skip = 0
+    page_limit = 200
+    while True:
+        code, raw = request_json(
+            base_url,
+            "GET",
+            f"/orders?skip={skip}&limit={page_limit}",
+            timeout=120.0,
+        )
+        if code != 200:
+            print(
+                f"[data_loader] GET /orders failed HTTP {code}: {raw[:300]!r}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        batch = json_load(raw)
+        if not isinstance(batch, list) or not batch:
+            break
+        for o in batch:
+            if not isinstance(o, dict):
+                continue
+            try:
+                oid = int(o["order_id"])
+                cid = int(o["customer_id"])
+                fid = int(o["food_place_id"])
+                coid = o.get("courier_id")
+                coid_i = int(coid) if coid is not None else None
+            except (KeyError, TypeError, ValueError):
+                continue
+            if (
+                cid in customers
+                or fid in foods
+                or (coid_i is not None and coid_i in couriers)
+            ):
+                order_ids.append(oid)
+        if len(batch) < page_limit:
+            break
+        skip += page_limit
+
+    for oid in sorted(set(order_ids), reverse=True):
+        code, _ = request_json(base_url, "DELETE", f"/orders/{oid}", timeout=60.0)
+        if code not in (204, 404):
+            print(
+                f"[data_loader] DELETE /orders/{oid} -> HTTP {code}",
+                file=sys.stderr,
+            )
+
+    for coid in sorted(couriers, reverse=True):
+        code, _ = request_json(base_url, "DELETE", f"/couriers/{coid}", timeout=60.0)
+        if code not in (204, 404):
+            print(
+                f"[data_loader] DELETE /couriers/{coid} -> HTTP {code}",
+                file=sys.stderr,
+            )
+
+    for fid in sorted(foods, reverse=True):
+        code, _ = request_json(base_url, "DELETE", f"/food-places/{fid}", timeout=60.0)
+        if code not in (204, 404):
+            print(
+                f"[data_loader] DELETE /food-places/{fid} -> HTTP {code}",
+                file=sys.stderr,
+            )
+
+    for cid in sorted(customers, reverse=True):
+        code, raw = request_json(base_url, "DELETE", f"/customers/{cid}", timeout=60.0)
+        if code not in (204, 404):
+            print(
+                f"[data_loader] DELETE /customers/{cid} -> HTTP {code}: {raw[:200]!r}",
+                file=sys.stderr,
+            )
 
 
 def main() -> None:
@@ -67,6 +171,11 @@ def main() -> None:
     n_couriers = n_c * args.courier_factor
     if n_c < 1:
         p.error("--customers must be at least 1")
+
+    out_path = Path(args.state_file)
+    previous = _load_state(out_path)
+    if previous:
+        _delete_tracked_entities(args.base_url, previous)
 
     routing_url = args.routing_base_url or args.base_url
     pool_n = n_c + n_c + n_couriers
@@ -135,6 +244,12 @@ def main() -> None:
             sys.exit(1)
         courier_ids.append(int(json_load(raw)["courier_id"]))
 
+    prev_runs: list[Any] = []
+    if previous and isinstance(previous.get("meta"), dict):
+        pr = previous["meta"].get("runs")
+        if isinstance(pr, list):
+            prev_runs = pr
+
     state = {
         "customer_ids": customer_ids,
         "food_place_ids": food_place_ids,
@@ -143,9 +258,17 @@ def main() -> None:
             "customers": n_c,
             "courier_factor": args.courier_factor,
             "run_id": run_id,
+            "runs": prev_runs
+            + [
+                {
+                    "run_id": run_id,
+                    "customers": n_c,
+                    "courier_factor": args.courier_factor,
+                    "replaced_previous": bool(previous),
+                }
+            ],
         },
     }
-    out_path = Path(args.state_file)
     out_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
     print(
         f"[data_loader] wrote {out_path}: {n_c} customers, {n_c} food places, "
