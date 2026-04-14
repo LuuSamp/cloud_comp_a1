@@ -38,7 +38,7 @@ class OrderOut(BaseModel):
     order_status: str
     customer_id: int
     food_place_id: int
-    courier_id: int
+    courier_id: int | None
 
 
 _SELECT_ORDER = """
@@ -76,23 +76,23 @@ def create_order(
             cur.execute(
                 """
                 SELECT courier_id, initial_lat, initial_lon FROM couriers
-                WHERE status = 'idle'
+                WHERE status = 'available'
                 """,
             )
-            idle = cur.fetchall()
+            available = cur.fetchall()
         if not crow or not frow:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST,
                 detail="customer or restaurant not found",
             )
-        if not idle:
+        if not available:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST,
-                detail="no idle couriers available for assignment",
+                detail="no available couriers for assignment",
             )
         candidates = [
             (r["courier_id"], float(r["initial_lat"]), float(r["initial_lon"]))
-            for r in idle
+            for r in available
         ]
         try:
             courier_id, _dist = nearest_courier(

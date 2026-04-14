@@ -90,7 +90,7 @@ CREATE TABLE IF NOT EXISTS orders (
     order_status_id INT NOT NULL DEFAULT 1 REFERENCES order_statuses(order_status_id),
     customer_id     INT NOT NULL REFERENCES customers(customer_id),
     food_place_id   INT NOT NULL REFERENCES food_places(food_place_id),
-    courier_id      INT NOT NULL REFERENCES couriers(courier_id)
+    courier_id      INT REFERENCES couriers(courier_id)
 )
     """,
 ]
@@ -189,6 +189,16 @@ SCHEMA_MIGRATIONS = [
                 ELSE 1 END;
             ALTER TABLE orders ALTER COLUMN order_status_id SET NOT NULL;
             ALTER TABLE orders DROP COLUMN status;
+        END IF;
+    END $m$;""",
+    """DO $m$ BEGIN
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'orders'
+              AND column_name = 'courier_id'
+              AND is_nullable = 'NO'
+        ) THEN
+            ALTER TABLE orders ALTER COLUMN courier_id DROP NOT NULL;
         END IF;
     END $m$;""",
 ]

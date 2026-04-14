@@ -32,7 +32,11 @@ def _aws_region() -> str:
 
 
 def graph_s3_object_key(place: str, network_type: str) -> str:
-    """S3 object key: graphs/{slugified_place}__{network_type}.graphml (UTF-8 safe)."""
+    """S3 object key: graphs/{slugified_place}__{network_type}.graphml (UTF-8 safe).
+
+    Deploy seeds a local GraphML to this key in tools/s3_routing_graph_infra.py
+    (graph_s3_object_key_for_seed); keep the slug rules identical.
+    """
     raw = f"{place}__{network_type}".lower()
     slug = re.sub(r"[^\w]+", "_", raw, flags=re.UNICODE)
     slug = slug.strip("_")

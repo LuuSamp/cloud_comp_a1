@@ -59,3 +59,26 @@ def nearest_courier(
     if cid is None or dist is None:
         raise RoutingClientError("routing service returned no assignment")
     return int(cid), float(dist)
+
+
+def shortest_path(
+    origin_lat: float,
+    origin_lng: float,
+    destination_lat: float,
+    destination_lng: float,
+    *,
+    timeout_s: float = 120.0,
+) -> float:
+    """Return route distance in meters between origin and destination."""
+    body = {
+        "origin": {"lat": origin_lat, "lng": origin_lng},
+        "destination": {"lat": destination_lat, "lng": destination_lng},
+    }
+    data = _post_json("/routing/v1/shortest-path", body, timeout_s=timeout_s)
+    err = data.get("error")
+    if err:
+        raise RoutingClientError(str(err))
+    dist = data.get("distance_m")
+    if dist is None:
+        raise RoutingClientError("routing service returned no route distance")
+    return float(dist)

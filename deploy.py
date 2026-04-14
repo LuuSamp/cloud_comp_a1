@@ -18,9 +18,13 @@ Usage:
   python deploy.py --skip-teardown    # writes connection.env after success
   python deploy.py --teardown-only    # destroy from connection.env
   python deploy.py --service ordering   # rebuild/push one service from connection.env
+  python deploy.py --service tracking --recreate   # also set desired_count from _service_specs (UpdateService only)
+  python deploy.py --resume   # reuse RDS/Dynamo/S3 from connection.env; rebuild ECS (implies --skip-teardown)
 
   Single-service redeploy uses connection.env (run a full deploy with --skip-teardown first).
-  For ordering, set DIJKFOOD_DB_PASSWORD in .env; DB_HOST is stored in connection.env.
+  Ordering/tracking redeploy: DIJKFOOD_DB_PASSWORD is optional if the service already runs with
+  DB_PASSWORD in ECS — the script reuses that value for the new task definition (no RDS changes).
+  --resume: same ECS fallback after load_connection_env; DB_HOST is in connection.env.
 
 Load testing is separate — after deploy, run e.g.:
   python -m simulator.load_sim --base-url "http://<alb-dns>"
@@ -80,6 +84,7 @@ from tools.s3_routing_graph_infra import (
     attach_routing_graph_s3_policy,
     create_routing_graph_bucket,
     destroy_routing_graph_bucket,
+    upload_routing_graph_seed_if_present,
 )
 from tools.rds_infra import (
     allow_rds_from_ecs_tasks,
@@ -109,11 +114,64 @@ def _db_password() -> str:
     return secrets.token_urlsafe(24)
 
 
+def _db_password_from_ecs_service(
+    ecs, *, cluster: str, service_name: str
+) -> str:
+    """
+    Read DB_PASSWORD from the service's current task definition so redeploy/register
+    can rotate the image without DIJKFOOD_DB_PASSWORD in .env (unchanged RDS password).
+    """
+    try:
+        svcs = ecs.describe_services(cluster=cluster, services=[service_name]).get(
+            "services"
+        ) or []
+        if not svcs or svcs[0].get("status") == "INACTIVE":
+            return ""
+        td_arn = (svcs[0].get("taskDefinition") or "").strip()
+        if not td_arn:
+            return ""
+        td = ecs.describe_task_definition(taskDefinition=td_arn).get(
+            "taskDefinition"
+        ) or {}
+        for c in td.get("containerDefinitions") or []:
+            for pair in c.get("environment") or []:
+                if pair.get("name") == "DB_PASSWORD":
+                    v = (pair.get("value") or "").strip()
+                    if v:
+                        return v
+    except ClientError:
+        return ""
+    return ""
+
+
 def _snapshot_connection_env(
-    state: DeploymentState, base_url: str = "", *, quiet: bool = True
+    state: DeploymentState,
+    base_url: str = "",
+    *,
+    region: str | None = None,
+    quiet: bool = True,
 ) -> None:
     """Persist connection.env so teardown-only works if the deploy process stops mid-way."""
-    write_connection_env(state, base_url, REGION, quiet=quiet)
+    write_connection_env(state, base_url, region or REGION, quiet=quiet)
+
+
+def _refresh_rds_endpoint(rds, state: DeploymentState) -> str:
+    if not state.rds_instance_id:
+        raise ValueError("connection.env: RDS_INSTANCE_ID is required to reuse RDS")
+    resp = rds.describe_db_instances(DBInstanceIdentifier=state.rds_instance_id)
+    inst = resp["DBInstances"][0]
+    ep = inst["Endpoint"]["Address"]
+    state.rds_endpoint = ep
+    return ep
+
+
+def _hydrate_dynamo_arns(ddb, state: DeploymentState) -> None:
+    if state.dynamo_order_logs_table:
+        t = ddb.describe_table(TableName=state.dynamo_order_logs_table)["Table"]
+        state.dynamo_order_logs_arn = t["TableArn"]
+    if state.dynamo_courier_positions_table:
+        t = ddb.describe_table(TableName=state.dynamo_courier_positions_table)["Table"]
+        state.dynamo_courier_positions_arn = t["TableArn"]
 
 
 SERVICE_IDS = ("ordering", "tracking", "routing")
@@ -129,19 +187,19 @@ def _service_specs(project_root: Path) -> list[dict[str, object]]:
             "path_pattern": "default",
             "cpu": "256",
             "memory": "512",
-            "desired_count": 1,
+            "desired_count": 3,
             "full_stack_env": True,
         },
         {
             "id": "tracking",
             "ecr_suffix": "tracking",
-            "docker_context": project_root / "services" / "tracking",
+            "docker_context": project_root,
             "dockerfile": project_root / "services" / "tracking" / "Dockerfile",
             "path_pattern": "/tracking*",
             "cpu": "256",
-            "memory": "512",
-            "desired_count": 1,
-            "full_stack_env": False,
+            "memory": "1024",
+            "desired_count": 6,
+            "full_stack_env": True,
         },
         {
             "id": "routing",
@@ -149,9 +207,9 @@ def _service_specs(project_root: Path) -> list[dict[str, object]]:
             "docker_context": project_root / "services" / "routing",
             "dockerfile": project_root / "services" / "routing" / "Dockerfile",
             "path_pattern": "/routing*",
-            "cpu": "512",
-            "memory": "4096",
-            "desired_count": 1,
+            "cpu": "2048",
+            "memory": "8192",
+            "desired_count": 3,
             "full_stack_env": False,
             "health_check_grace_seconds": 600,
         },
@@ -165,8 +223,15 @@ def _spec_for_id(specs: list[dict[str, object]], service_id: str) -> dict[str, o
     raise KeyError(service_id)
 
 
-def redeploy_single_service(project_root: Path, service_id: str) -> None:
-    """Build/push one image and roll ECS to a new task definition using connection.env."""
+def redeploy_single_service(
+    project_root: Path, service_id: str, *, apply_service_spec: bool = False
+) -> None:
+    """
+    Build/push one image and roll ECS to a new task definition using connection.env.
+    CPU/memory always come from _service_specs in the new task definition.
+    If apply_service_spec True (--recreate), desired_count is set in the same UpdateService
+    call (no ECS service deletion or replace).
+    """
     try:
         state, region, base_url = load_connection_env()
     except (FileNotFoundError, ValueError) as e:
@@ -215,6 +280,7 @@ def redeploy_single_service(project_root: Path, service_id: str) -> None:
     password = (os.environ.get("DIJKFOOD_DB_PASSWORD") or "").strip()
 
     def _ordering_environment_redeploy() -> list[dict[str, str]]:
+        nonlocal password
         db_host = (state.rds_endpoint or "").strip()
         if not db_host and state.rds_instance_id:
             rds_client = session.client("rds")
@@ -231,8 +297,15 @@ def redeploy_single_service(project_root: Path, service_id: str) -> None:
             )
             raise SystemExit(1)
         if not password:
+            password = _db_password_from_ecs_service(
+                ecs,
+                cluster=state.cluster_name,
+                service_name=rec.service_name,
+            )
+        if not password:
             print(
-                "[deploy] ERROR: ordering redeploy requires DIJKFOOD_DB_PASSWORD in .env"
+                "[deploy] ERROR: no DB password for redeploy: set DIJKFOOD_DB_PASSWORD in .env, "
+                "or ensure this service's current ECS task has DB_PASSWORD (from a prior deploy)."
             )
             raise SystemExit(1)
         return [
@@ -286,6 +359,10 @@ def redeploy_single_service(project_root: Path, service_id: str) -> None:
         env = _stub_environment_redeploy(service_id)
 
     print(f"[deploy] --- Single-service redeploy: {service_id} (cluster={state.cluster_name}) ---")
+    if service_id == "routing" and state.routing_graph_s3_bucket:
+        upload_routing_graph_seed_if_present(
+            session.client("s3"), state.routing_graph_s3_bucket
+        )
     ensure_ecr_repository(ecr, rec.ecr_repo_name)
     image_uri = build_and_push_image(
         region=region,
@@ -308,12 +385,19 @@ def redeploy_single_service(project_root: Path, service_id: str) -> None:
         cpu=str(spec["cpu"]),
         memory=str(spec["memory"]),
     )
+    if apply_service_spec:
+        dc = int(spec["desired_count"])
+        print(
+            f"[deploy] --recreate: desired_count={dc} from _service_specs "
+            "(cpu/memory already in new task revision; single UpdateService)"
+        )
     update_ecs_service_task_definition(
         ecs,
         cluster=state.cluster_name,
         service=rec.service_name,
         task_definition_arn=td_arn,
         health_check_grace_period_seconds=grace,
+        desired_count=(int(spec["desired_count"]) if apply_service_spec else None),
     )
     wait_for_service_stable(ecs, state.cluster_name, rec.service_name)
     write_connection_env(state, base_url, region, quiet=False)
@@ -377,15 +461,44 @@ def main() -> None:
         choices=list(SERVICE_IDS),
         help="Redeploy one microservice (ordering|tracking|routing) using connection.env",
     )
+    parser.add_argument(
+        "--recreate",
+        action="store_true",
+        help=(
+            "With --service: apply desired_count from deploy.py _service_specs via the same "
+            "ECS UpdateService as the new task definition (no service teardown). CPU and memory "
+            "from _service_specs are already applied on every --service run as a new task revision."
+        ),
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Reuse deployment id and existing RDS/Dynamo/S3 from connection.env when present "
+            "(no second instance/tables/bucket). Rebuilds and rolls all ECS services. "
+            "Implies --skip-teardown. DB password: DIJKFOOD_DB_PASSWORD or reuse DB_PASSWORD "
+            "from an existing ordering/tracking ECS task definition."
+        ),
+    )
     args = parser.parse_args()
 
     project_root = _PROJECT_ROOT
 
     if args.teardown_only and args.service:
         parser.error("cannot combine --teardown-only and --service")
+    if args.teardown_only and args.resume:
+        parser.error("cannot combine --teardown-only and --resume")
+    if args.service and args.resume:
+        parser.error("cannot combine --service and --resume")
+    if args.recreate and not args.service:
+        parser.error("--recreate requires --service")
+    if args.resume:
+        args.skip_teardown = True
 
     if args.service:
-        redeploy_single_service(project_root, args.service)
+        redeploy_single_service(
+            project_root, args.service, apply_service_spec=args.recreate
+        )
         return
 
     if args.teardown_only:
@@ -411,9 +524,51 @@ def main() -> None:
             print(f"[deploy] Removed {CONNECTION_ENV_PATH}")
         sys.exit(0)
 
-    suffix = secrets.token_hex(3)
-    password = _db_password()
-    state = DeploymentState(suffix=suffix)
+    deploy_region = REGION
+    base_url_from_conn = ""
+
+    if args.resume:
+        if not CONNECTION_ENV_PATH.is_file():
+            print(f"[deploy] ERROR: --resume requires {CONNECTION_ENV_PATH}")
+            sys.exit(1)
+        try:
+            state, deploy_region, base_url_from_conn = load_connection_env()
+        except (FileNotFoundError, ValueError) as e:
+            print(f"[deploy] ERROR: {e}")
+            sys.exit(1)
+        resume_pw = (os.environ.get("DIJKFOOD_DB_PASSWORD") or "").strip()
+        if not resume_pw and state.cluster_name:
+            ecs_probe = boto3.Session(region_name=deploy_region).client("ecs")
+            for sid in ("ordering", "tracking"):
+                rec = next(
+                    (r for r in state.ecs_services if r.service_id == sid), None
+                )
+                if rec is None:
+                    continue
+                resume_pw = _db_password_from_ecs_service(
+                    ecs_probe,
+                    cluster=state.cluster_name,
+                    service_name=rec.service_name,
+                )
+                if resume_pw:
+                    print(
+                        f"[deploy] --resume: using DB_PASSWORD from ECS task ({sid}); "
+                        "set DIJKFOOD_DB_PASSWORD to use a different value."
+                    )
+                    break
+        if not resume_pw:
+            print(
+                "[deploy] ERROR: --resume needs the RDS password for schema bootstrap: "
+                "set DIJKFOOD_DB_PASSWORD in .env, or ensure ordering/tracking still has "
+                "DB_PASSWORD on its current task definition."
+            )
+            sys.exit(1)
+        suffix = state.suffix
+        password = resume_pw
+    else:
+        suffix = secrets.token_hex(3)
+        password = _db_password()
+        state = DeploymentState(suffix=suffix)
 
     try:
         resolve_container_cli()
@@ -421,7 +576,7 @@ def main() -> None:
         print(f"[deploy] ERROR: {e}")
         sys.exit(1)
 
-    session = boto3.Session(region_name=REGION)
+    session = boto3.Session(region_name=deploy_region)
     ec2 = session.client("ec2")
     rds = session.client("rds")
     sts = session.client("sts")
@@ -434,33 +589,65 @@ def main() -> None:
     s3 = session.client("s3")
 
     account_id = sts.get_caller_identity()["Account"]
-    db_instance_id = f"dijkfood-db-{suffix}"
 
     exit_code = 1
     alb_dns: str | None = None
 
     try:
-        print(f"[deploy] DeploymentId={suffix} region={REGION}")
+        skip_rds = args.resume and bool(state.rds_instance_id)
+        skip_dynamo = args.resume and bool(
+            state.dynamo_order_logs_table and state.dynamo_courier_positions_table
+        )
+        skip_s3 = args.resume and bool(state.routing_graph_s3_bucket)
+        saved_ecs_records = list(state.ecs_services)
+        ecs_rebuild_only = (
+            args.resume
+            and bool(state.cluster_name)
+            and len(saved_ecs_records) > 0
+        )
+
+        print(f"[deploy] DeploymentId={suffix} region={deploy_region}")
+        if args.resume:
+            print(
+                "[deploy] --resume: "
+                f"RDS={'skip' if skip_rds else 'create'}, "
+                f"DynamoDB={'skip' if skip_dynamo else 'create'}, "
+                f"S3={'skip' if skip_s3 else 'create'}, "
+                f"ECS={'rebuild-only' if ecs_rebuild_only else 'full'}"
+            )
         vpc_id = get_default_vpc_id(ec2)
         subnet_ids = get_default_subnet_ids(ec2, vpc_id)
 
-        print("[deploy] --- RDS ---")
-        rds_sg = create_rds_security_group(ec2, vpc_id, suffix, state)
-        create_db_subnet_group(rds, subnet_ids, suffix, state)
-        _snapshot_connection_env(state)
+        if skip_rds:
+            print("[deploy] --- RDS (resume: existing instance) ---")
+            if not state.rds_sg_id:
+                raise RuntimeError(
+                    "Resume requires RDS_SECURITY_GROUP_ID in connection.env"
+                )
+            rds_sg = state.rds_sg_id
+            endpoint = _refresh_rds_endpoint(rds, state)
+            _snapshot_connection_env(state, region=deploy_region)
+        else:
+            print("[deploy] --- RDS ---")
+            rds_sg = create_rds_security_group(ec2, vpc_id, suffix, state)
+            create_db_subnet_group(rds, subnet_ids, suffix, state)
+            _snapshot_connection_env(state, region=deploy_region)
 
-        endpoint = create_rds_instance(
-            rds,
-            instance_id=db_instance_id,
-            subnet_group=state.db_subnet_group or "",
-            sg_id=rds_sg,
-            db_name=DB_NAME,
-            master_user=DB_MASTER_USER,
-            master_password=password,
-            suffix=suffix,
-            state=state,
-        )
-        state.rds_endpoint = endpoint
+            db_instance_id = f"dijkfood-db-{suffix}"
+            endpoint = create_rds_instance(
+                rds,
+                instance_id=db_instance_id,
+                subnet_group=state.db_subnet_group or "",
+                sg_id=rds_sg,
+                db_name=DB_NAME,
+                master_user=DB_MASTER_USER,
+                master_password=password,
+                suffix=suffix,
+                state=state,
+            )
+            state.rds_endpoint = endpoint
+            _snapshot_connection_env(state, region=deploy_region)
+
         run_schema_bootstrap(
             endpoint,
             5432,
@@ -468,20 +655,27 @@ def main() -> None:
             DB_MASTER_USER,
             password,
         )
-        _snapshot_connection_env(state)
+        _snapshot_connection_env(state, region=deploy_region)
 
-        print("[deploy] --- DynamoDB ---")
-        create_dynamodb_tables(ddb, suffix, state)
-        _snapshot_connection_env(state)
+        if skip_dynamo:
+            print("[deploy] --- DynamoDB (resume: existing tables) ---")
+            _hydrate_dynamo_arns(ddb, state)
+        else:
+            print("[deploy] --- DynamoDB ---")
+            create_dynamodb_tables(ddb, suffix, state)
+        _snapshot_connection_env(state, region=deploy_region)
 
-        print("[deploy] --- S3 (routing graph cache) ---")
-        create_routing_graph_bucket(s3, suffix, REGION, state)
-        _snapshot_connection_env(state)
-
-        print("[deploy] --- Networking / ALB / ECS ---")
-        alb_sg = create_alb_security_group(ec2, vpc_id, suffix, state)
-        task_sg = create_ecs_task_security_group(ec2, vpc_id, alb_sg, suffix, state)
-        allow_rds_from_ecs_tasks(ec2, rds_sg, task_sg)
+        if skip_s3:
+            print("[deploy] --- S3 (resume: existing bucket) ---")
+            if not state.routing_graph_s3_bucket:
+                raise RuntimeError(
+                    "connection.env promised S3 reuse but ROUTING_GRAPH_S3_BUCKET is empty"
+                )
+        else:
+            print("[deploy] --- S3 (routing graph cache) ---")
+            create_routing_graph_bucket(s3, suffix, deploy_region, state)
+        upload_routing_graph_seed_if_present(s3, state.routing_graph_s3_bucket or "")
+        _snapshot_connection_env(state, region=deploy_region)
 
         exec_arn = ensure_execution_role(iam, suffix, state)
         task_arn = ensure_task_role(iam, suffix, state)
@@ -516,44 +710,16 @@ def main() -> None:
         time.sleep(10)
 
         specs = _service_specs(project_root)
-        tg_by_id: dict[str, str] = {}
-        for spec in specs:
-            sid = str(spec["id"])
-            tg_by_id[sid] = create_target_group(elbv2, vpc_id, suffix, sid)
-        _snapshot_connection_env(state)
 
-        alb_arn, alb_dns = create_alb_only(
-            elbv2, subnet_ids, alb_sg, suffix, state
-        )
-        path_rules: list[tuple[int, str, str]] = []
-        priority = 10
-        for spec in specs:
-            pat = str(spec["path_pattern"])
-            if pat != "default":
-                sid = str(spec["id"])
-                path_rules.append((priority, pat, tg_by_id[sid]))
-                priority += 10
-        create_listener_and_rules(
-            elbv2,
-            alb_arn=alb_arn,
-            default_target_group_arn=tg_by_id["ordering"],
-            path_forward_rules=path_rules,
-            state=state,
-        )
-        _snapshot_connection_env(state, f"http://{alb_dns}")
-
-        cluster = f"dijkfood-{suffix}"
-        alb_base_url = f"http://{alb_dns}"
-
-        def _ordering_environment() -> list[dict[str, str]]:
+        def _ordering_env(alb_base_url: str) -> list[dict[str, str]]:
             return [
                 {"name": "DB_HOST", "value": endpoint},
                 {"name": "DB_PORT", "value": "5432"},
                 {"name": "DB_NAME", "value": DB_NAME},
                 {"name": "DB_USER", "value": DB_MASTER_USER},
                 {"name": "DB_PASSWORD", "value": password},
-                {"name": "AWS_REGION", "value": REGION},
-                {"name": "AWS_DEFAULT_REGION", "value": REGION},
+                {"name": "AWS_REGION", "value": deploy_region},
+                {"name": "AWS_DEFAULT_REGION", "value": deploy_region},
                 {"name": "ROUTING_BASE_URL", "value": alb_base_url},
                 {
                     "name": "DYNAMODB_ORDER_LOGS_TABLE",
@@ -565,10 +731,10 @@ def main() -> None:
                 },
             ]
 
-        def _routing_environment() -> list[dict[str, str]]:
+        def _routing_env() -> list[dict[str, str]]:
             env = [
-                {"name": "AWS_REGION", "value": REGION},
-                {"name": "AWS_DEFAULT_REGION", "value": REGION},
+                {"name": "AWS_REGION", "value": deploy_region},
+                {"name": "AWS_DEFAULT_REGION", "value": deploy_region},
                 {"name": "SERVICE_ID", "value": "routing"},
                 {"name": "OSMNX_PLACE", "value": "São Paulo, SP, Brazil"},
                 {"name": "ROUTING_NETWORK_TYPE", "value": "drive"},
@@ -582,67 +748,190 @@ def main() -> None:
                 )
             return env
 
-        def _stub_environment(label: str) -> list[dict[str, str]]:
+        def _stub_env(label: str) -> list[dict[str, str]]:
             return [
-                {"name": "AWS_REGION", "value": REGION},
-                {"name": "AWS_DEFAULT_REGION", "value": REGION},
+                {"name": "AWS_REGION", "value": deploy_region},
+                {"name": "AWS_DEFAULT_REGION", "value": deploy_region},
                 {"name": "SERVICE_ID", "value": label},
             ]
 
-        for i, spec in enumerate(specs):
-            svc_id = str(spec["id"])
-            repo_name = f"dijkfood-{spec['ecr_suffix']}-{suffix}"
-            ensure_ecr_repository(ecr, repo_name)
-            image_uri = build_and_push_image(
-                region=REGION,
-                account_id=account_id,
-                repo_name=repo_name,
-                docker_context=spec["docker_context"],  # type: ignore[arg-type]
-                dockerfile=spec["dockerfile"],  # type: ignore[arg-type]
+        if ecs_rebuild_only:
+            print("[deploy] --- ECS (resume: rebuild images; ALB unchanged) ---")
+            if not state.ecs_task_sg_id:
+                raise RuntimeError(
+                    "Resume ECS rebuild requires ECS_TASK_SECURITY_GROUP_ID in connection.env"
+                )
+            bu = (base_url_from_conn or "").strip().rstrip("/")
+            if not bu:
+                raise RuntimeError(
+                    "Resume ECS rebuild requires BASE_URL in connection.env (e.g. http://your-alb-dns)"
+                )
+            alb_base_url = bu
+            if not alb_base_url.startswith("http"):
+                alb_base_url = f"http://{alb_base_url}"
+            alb_dns = (
+                alb_base_url.removeprefix("http://")
+                .removeprefix("https://")
+                .split("/")[0]
             )
-            log_grp = f"/ecs/dijkfood-{svc_id}-{suffix}"
-            ensure_log_group(logs, log_grp)
-            if spec["full_stack_env"]:
-                env = _ordering_environment()
-            elif svc_id == "routing":
-                env = _routing_environment()
-            else:
-                env = _stub_environment(svc_id)
-            svc_name = f"dijkfood-{svc_id}-{suffix}"
-            family = f"dijkfood-{svc_id}-{suffix}"
-            create_ecs_service(
-                ecs,
-                cluster_name=cluster,
-                service_name=svc_name,
-                service_id=svc_id,
-                task_family=family,
-                image_uri=image_uri,
-                execution_role_arn=exec_arn,
-                task_role_arn=task_arn,
-                log_group=log_grp,
-                region=REGION,
-                subnet_ids=subnet_ids,
-                task_sg_id=task_sg,
-                target_group_arn=tg_by_id[svc_id],
-                suffix=suffix,
-                state=state,
-                environment=env,
-                cpu=str(spec["cpu"]),
-                memory=str(spec["memory"]),
-                desired_count=int(spec["desired_count"]),
-                create_cluster_if_needed=(i == 0),
-                health_check_grace_period_seconds=int(
-                    spec.get("health_check_grace_seconds", 120)
-                ),
-            )
-            wait_for_service_stable(ecs, cluster, svc_name)
-            _snapshot_connection_env(state, f"http://{alb_dns}")
 
-        print(
-            f"[deploy] All ECS services stable. ALB: http://{alb_dns}\n"
-            "[deploy] Run load tests manually, e.g. "
-            f"python -m simulator.load_sim --base-url http://{alb_dns}"
-        )
+            task_sg = state.ecs_task_sg_id
+            allow_rds_from_ecs_tasks(ec2, rds_sg, task_sg)
+
+            rec_by_id = {r.service_id: r for r in saved_ecs_records}
+            if len(rec_by_id) != len(saved_ecs_records):
+                raise RuntimeError("Duplicate service_id entries in ECS_SERVICES_JSON")
+            state.ecs_services = []
+            cluster = state.cluster_name
+            assert cluster is not None
+
+            for spec in specs:
+                svc_id = str(spec["id"])
+                rec = rec_by_id.get(svc_id)
+                if rec is None:
+                    raise RuntimeError(
+                        f"--resume: missing service_id {svc_id!r} in ECS_SERVICES_JSON"
+                    )
+                repo_name = f"dijkfood-{spec['ecr_suffix']}-{suffix}"
+                ensure_ecr_repository(ecr, repo_name)
+                image_uri = build_and_push_image(
+                    region=deploy_region,
+                    account_id=account_id,
+                    repo_name=repo_name,
+                    docker_context=spec["docker_context"],  # type: ignore[arg-type]
+                    dockerfile=spec["dockerfile"],  # type: ignore[arg-type]
+                )
+                ensure_log_group(logs, rec.log_group_name)
+                if spec["full_stack_env"]:
+                    env = _ordering_env(alb_base_url)
+                elif svc_id == "routing":
+                    env = _routing_env()
+                else:
+                    env = _stub_env(svc_id)
+                create_ecs_service(
+                    ecs,
+                    cluster_name=cluster,
+                    service_name=rec.service_name,
+                    service_id=svc_id,
+                    task_family=rec.task_definition_family,
+                    image_uri=image_uri,
+                    execution_role_arn=exec_arn,
+                    task_role_arn=task_arn,
+                    log_group=rec.log_group_name,
+                    region=deploy_region,
+                    subnet_ids=subnet_ids,
+                    task_sg_id=task_sg,
+                    target_group_arn=rec.target_group_arn,
+                    suffix=suffix,
+                    state=state,
+                    environment=env,
+                    cpu=str(spec["cpu"]),
+                    memory=str(spec["memory"]),
+                    desired_count=int(spec["desired_count"]),
+                    create_cluster_if_needed=False,
+                    health_check_grace_period_seconds=int(
+                        spec.get("health_check_grace_seconds", 120)
+                    ),
+                )
+                wait_for_service_stable(ecs, cluster, rec.service_name)
+                _snapshot_connection_env(state, alb_base_url, region=deploy_region)
+
+            print(
+                f"[deploy] All ECS services stable. ALB: {alb_base_url}\n"
+                "[deploy] Run load tests manually, e.g. "
+                f"python -m simulator.load_sim --base-url {alb_base_url}"
+            )
+        else:
+            print("[deploy] --- Networking / ALB / ECS ---")
+            alb_sg = create_alb_security_group(ec2, vpc_id, suffix, state)
+            task_sg = create_ecs_task_security_group(ec2, vpc_id, alb_sg, suffix, state)
+            allow_rds_from_ecs_tasks(ec2, rds_sg, task_sg)
+
+            tg_by_id: dict[str, str] = {}
+            for spec in specs:
+                sid = str(spec["id"])
+                tg_by_id[sid] = create_target_group(elbv2, vpc_id, suffix, sid)
+            _snapshot_connection_env(state, region=deploy_region)
+
+            alb_arn, alb_dns = create_alb_only(
+                elbv2, subnet_ids, alb_sg, suffix, state
+            )
+            path_rules: list[tuple[int, str, str]] = []
+            priority = 10
+            for spec in specs:
+                pat = str(spec["path_pattern"])
+                if pat != "default":
+                    sid = str(spec["id"])
+                    path_rules.append((priority, pat, tg_by_id[sid]))
+                    priority += 10
+            create_listener_and_rules(
+                elbv2,
+                alb_arn=alb_arn,
+                default_target_group_arn=tg_by_id["ordering"],
+                path_forward_rules=path_rules,
+                state=state,
+            )
+            _snapshot_connection_env(state, f"http://{alb_dns}", region=deploy_region)
+
+            cluster = f"dijkfood-{suffix}"
+            alb_base_url = f"http://{alb_dns}"
+
+            for i, spec in enumerate(specs):
+                svc_id = str(spec["id"])
+                repo_name = f"dijkfood-{spec['ecr_suffix']}-{suffix}"
+                ensure_ecr_repository(ecr, repo_name)
+                image_uri = build_and_push_image(
+                    region=deploy_region,
+                    account_id=account_id,
+                    repo_name=repo_name,
+                    docker_context=spec["docker_context"],  # type: ignore[arg-type]
+                    dockerfile=spec["dockerfile"],  # type: ignore[arg-type]
+                )
+                log_grp = f"/ecs/dijkfood-{svc_id}-{suffix}"
+                ensure_log_group(logs, log_grp)
+                if spec["full_stack_env"]:
+                    env = _ordering_env(alb_base_url)
+                elif svc_id == "routing":
+                    env = _routing_env()
+                else:
+                    env = _stub_env(svc_id)
+                svc_name = f"dijkfood-{svc_id}-{suffix}"
+                family = f"dijkfood-{svc_id}-{suffix}"
+                create_ecs_service(
+                    ecs,
+                    cluster_name=cluster,
+                    service_name=svc_name,
+                    service_id=svc_id,
+                    task_family=family,
+                    image_uri=image_uri,
+                    execution_role_arn=exec_arn,
+                    task_role_arn=task_arn,
+                    log_group=log_grp,
+                    region=deploy_region,
+                    subnet_ids=subnet_ids,
+                    task_sg_id=task_sg,
+                    target_group_arn=tg_by_id[svc_id],
+                    suffix=suffix,
+                    state=state,
+                    environment=env,
+                    cpu=str(spec["cpu"]),
+                    memory=str(spec["memory"]),
+                    desired_count=int(spec["desired_count"]),
+                    create_cluster_if_needed=(i == 0),
+                    health_check_grace_period_seconds=int(
+                        spec.get("health_check_grace_seconds", 120)
+                    ),
+                )
+                wait_for_service_stable(ecs, cluster, svc_name)
+                _snapshot_connection_env(
+                    state, f"http://{alb_dns}", region=deploy_region
+                )
+
+            print(
+                f"[deploy] All ECS services stable. ALB: http://{alb_dns}\n"
+                "[deploy] Run load tests manually, e.g. "
+                f"python -m simulator.load_sim --base-url http://{alb_dns}"
+            )
         exit_code = 0
 
     except Exception as e:
@@ -650,6 +939,14 @@ def main() -> None:
         if exit_code == 0:
             exit_code = 1
     finally:
+        def _snapshot_base_url() -> str:
+            if alb_dns:
+                return f"http://{alb_dns}"
+            raw = (base_url_from_conn or "").strip().rstrip("/")
+            if raw:
+                return raw if raw.startswith("http") else f"http://{raw}"
+            return ""
+
         if args.skip_teardown:
             print("[deploy] --skip-teardown: leaving AWS resources running.")
             if alb_dns:
@@ -657,16 +954,16 @@ def main() -> None:
             # Always refresh snapshot (deploy may have failed after partial provision).
             write_connection_env(
                 state,
-                f"http://{alb_dns}" if alb_dns else "",
-                REGION,
+                _snapshot_base_url(),
+                deploy_region,
                 quiet=False,
             )
             sys.exit(exit_code)
         if exit_code != 0:
             write_connection_env(
                 state,
-                f"http://{alb_dns}" if alb_dns else "",
-                REGION,
+                _snapshot_base_url(),
+                deploy_region,
                 quiet=False,
             )
             print(

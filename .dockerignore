@@ -1,0 +1,59 @@
+# Build context: repository root (ordering + tracking ECS images via deploy.py)
+# Keeps docker build/push fast; only app/ and services/tracking/* are copied by those Dockerfiles.
+
+# VCS
+.git
+.gitignore
+
+# Local Python environments (often huge)
+.venv
+venv
+**/.venv
+**/venv
+__pycache__
+**/__pycache__
+*.py[cod]
+*.egg-info
+.eggs
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+
+# Secrets and deploy snapshots
+.env
+connection.env
+*.pem
+
+# Large graph / local OSM dumps (not in ordering or tracking images)
+*.graphml
+**/*.graphml
+
+# Simulator, infra tools, deploy — not COPY'd by ordering/tracking Dockerfiles
+simulator/
+tools/
+download_graph_local.py
+deploy.py
+requirements-deploy.txt
+env.example
+
+# Other ECS services: not needed when context is repo root for ordering/tracking
+services/ordering/
+services/routing/
+
+# Docs and local state
+*.md
+*.pdf
+erdplus.png
+dijkfood_sim_state.json
+
+# IDE / OS
+.cursor
+.idea
+.vscode
+.DS_Store
+*~
+
+# Optional local app duplicate (ordering uses services/ordering/Dockerfile)
+app/Dockerfile

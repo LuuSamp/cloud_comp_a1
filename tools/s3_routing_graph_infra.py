@@ -5,6 +5,8 @@ S3 bucket for cached OSMnx routing graphs (GraphML) per deployment.
 from __future__ import annotations
 
 import json
+import re
+from pathlib import Path
 
 from botocore.exceptions import ClientError
 
@@ -12,6 +14,62 @@ from tools.state import DeploymentState
 
 TAG_PROJECT = "dijkfood-a1"
 ROUTING_GRAPH_S3_POLICY_NAME = "DijkFoodRoutingGraphS3"
+
+# Tools root.
+_TOOLS_ROOT = Path(__file__).resolve()
+
+
+# ---------------------------------------------------------------------------
+# Optional: local GraphML uploaded during full deploy / --resume after the
+# routing graph bucket exists. Edit ROUTING_GRAPH_SEED_SOURCE to point at
+# another file or set to None to disable seeding.
+#
+# SEED_GRAPH_PLACE and SEED_GRAPH_NETWORK_TYPE must match the S3 key that
+# services/routing/graph_service.py uses: graph_s3_object_key(place, network_type)
+# with the same place and network as OSMNX_PLACE / ROUTING_NETWORK_TYPE on ECS.
+# ---------------------------------------------------------------------------
+
+# the graph file should be in tools/graphs/são_paulo_sp_brazil__drive.graphml
+ROUTING_GRAPH_SEED_SOURCE = _TOOLS_ROOT / "graphs" / "são_paulo_sp_brazil__drive.graphml"
+SEED_GRAPH_PLACE = "São Paulo, SP, Brazil"
+SEED_GRAPH_NETWORK_TYPE = "drive"
+
+_MAX_SLUG_LEN = 180
+
+
+def graph_s3_object_key_for_seed(place: str, network_type: str) -> str:
+    """
+    Same naming as services/routing/graph_service.graph_s3_object_key — keep logic aligned.
+    """
+    raw = f"{place}__{network_type}".lower()
+    slug = re.sub(r"[^\w]+", "_", raw, flags=re.UNICODE)
+    slug = slug.strip("_")
+    if len(slug) > _MAX_SLUG_LEN:
+        slug = slug[:_MAX_SLUG_LEN].rstrip("_")
+    if not slug:
+        slug = "graph"
+    return f"graphs/{slug}.graphml"
+
+
+def upload_routing_graph_seed_if_present(s3, bucket: str) -> None:
+    """If ROUTING_GRAPH_SEED_SOURCE exists on disk, upload to the routing graph key in S3."""
+    if not bucket or not bucket.strip():
+        return
+    src = ROUTING_GRAPH_SEED_SOURCE
+    if src is None:
+        return
+    path = Path(src)
+    if not path.is_file():
+        print(f"  [S3] Graph seed not found at {path} (skip upload)")
+        return
+    key = graph_s3_object_key_for_seed(SEED_GRAPH_PLACE, SEED_GRAPH_NETWORK_TYPE)
+    try:
+        s3.upload_file(str(path), bucket, key)
+        print(f"  [S3] Seeded routing graph s3://{bucket}/{key} from {path.name}")
+    except ClientError as exc:
+        print(
+            f"  [S3] WARNING: could not upload graph seed to s3://{bucket}/{key}: {exc}"
+        )
 
 
 def routing_graph_bucket_name(suffix: str) -> str:

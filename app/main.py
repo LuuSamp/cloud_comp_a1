@@ -25,6 +25,7 @@ from routers import (
     order_statuses,
     orders,
     sim_placeholders,
+    workflow_orders,
 )
 
 app = FastAPI(title="DijkFood API")
@@ -37,6 +38,7 @@ app.include_router(orders.router)
 app.include_router(order_logs.router)
 app.include_router(courier_positions.router)
 app.include_router(sim_placeholders.router)
+app.include_router(workflow_orders.router)
 
 
 @app.get("/health")

@@ -89,6 +89,8 @@ def write_connection_env(
 
 def load_connection_env(
     path: Path | None = None,
+    *,
+    require_ecs_services_when_cluster_set: bool = True,
 ) -> tuple[DeploymentState, str, str]:
     p = path or CONNECTION_ENV_PATH
     load_dotenv(CONNECTION_ENV_PATH.parent / ".env")
@@ -118,7 +120,11 @@ def load_connection_env(
     state.listener_arn = (os.getenv(K_LISTENER_ARN) or "").strip() or None
     state.cluster_name = (os.getenv(K_CLUSTER) or "").strip() or None
     raw_svcs_early = (os.getenv(K_ECS_SERVICES_JSON) or "").strip()
-    if state.cluster_name and not raw_svcs_early:
+    if (
+        require_ecs_services_when_cluster_set
+        and state.cluster_name
+        and not raw_svcs_early
+    ):
         raise ValueError(
             f"{p}: {K_ECS_SERVICES_JSON} is required when {K_CLUSTER} is set "
             "(re-run deploy to regenerate connection.env)"

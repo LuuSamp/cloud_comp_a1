@@ -372,6 +372,7 @@ def update_ecs_service_task_definition(
     task_definition_arn: str,
     force_new_deployment: bool = True,
     health_check_grace_period_seconds: int | None = None,
+    desired_count: int | None = None,
 ) -> None:
     kwargs: dict[str, object] = {
         "cluster": cluster,
@@ -381,8 +382,13 @@ def update_ecs_service_task_definition(
     }
     if health_check_grace_period_seconds is not None:
         kwargs["healthCheckGracePeriodSeconds"] = health_check_grace_period_seconds
+    if desired_count is not None:
+        kwargs["desiredCount"] = int(desired_count)
     ecs.update_service(**kwargs)
-    print(f"  [ECS] Updated service {service} (new task definition)")
+    parts = ["task definition"]
+    if desired_count is not None:
+        parts.append(f"desiredCount={int(desired_count)}")
+    print(f"  [ECS] Updated service {service} ({', '.join(parts)})")
 
 
 def create_listener_and_rules(

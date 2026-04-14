@@ -1,0 +1,26 @@
+# Build context: services/routing (routing ECS image via deploy.py)
+# Dockerfile only COPYs: requirements.txt, main.py, graph_service.py, route_metrics.py
+
+.venv
+venv
+__pycache__
+**/__pycache__
+*.py[cod]
+*.egg-info
+.pytest_cache
+.mypy_cache
+.git
+.gitignore
+
+# Tests not copied into image
+test_route_length.py
+
+# Local graph experiments
+*.graphml
+**/*.graphml
+
+# IDE / OS
+.cursor
+.idea
+.vscode
+.DS_Store
