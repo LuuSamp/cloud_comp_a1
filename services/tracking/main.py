@@ -155,6 +155,7 @@ def update_order_status(body: UpdateOrderStatusIn) -> dict[str, Any]:
         item["detail"] = body.detail
     _order_logs_table().put_item(Item=item)
     if body.order_status_id == 3:
+        # Make this asynchronous so that the queue doesn't wait for the update to complete.
         _try_assign_courier(body.order_id)
     return {"ok": True, "order_id": body.order_id, "order_status_id": body.order_status_id}
 
