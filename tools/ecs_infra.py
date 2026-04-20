@@ -391,6 +391,62 @@ def update_ecs_service_task_definition(
     print(f"  [ECS] Updated service {service} ({', '.join(parts)})")
 
 
+def configure_ecs_service_autoscaling(
+    app_autoscaling,
+    *,
+    cluster_name: str,
+    service_name: str,
+    min_capacity: int,
+    max_capacity: int,
+    cpu_target: float,
+    memory_target: float,
+    scale_in_cooldown: int = 120,
+    scale_out_cooldown: int = 45,
+) -> None:
+    """Configure ECS desired-count target tracking for CPU and memory."""
+    resource_id = f"service/{cluster_name}/{service_name}"
+
+    app_autoscaling.register_scalable_target(
+        ServiceNamespace="ecs",
+        ResourceId=resource_id,
+        ScalableDimension="ecs:service:DesiredCount",
+        MinCapacity=int(min_capacity),
+        MaxCapacity=int(max_capacity),
+    )
+
+    app_autoscaling.put_scaling_policy(
+        PolicyName=f"{service_name}-cpu-target-tracking",
+        ServiceNamespace="ecs",
+        ResourceId=resource_id,
+        ScalableDimension="ecs:service:DesiredCount",
+        PolicyType="TargetTrackingScaling",
+        TargetTrackingScalingPolicyConfiguration={
+            "TargetValue": float(cpu_target),
+            "PredefinedMetricSpecification": {
+                "PredefinedMetricType": "ECSServiceAverageCPUUtilization"
+            },
+            "ScaleInCooldown": int(scale_in_cooldown),
+            "ScaleOutCooldown": int(scale_out_cooldown),
+        },
+    )
+
+    app_autoscaling.put_scaling_policy(
+        PolicyName=f"{service_name}-memory-target-tracking",
+        ServiceNamespace="ecs",
+        ResourceId=resource_id,
+        ScalableDimension="ecs:service:DesiredCount",
+        PolicyType="TargetTrackingScaling",
+        TargetTrackingScalingPolicyConfiguration={
+            "TargetValue": float(memory_target),
+            "PredefinedMetricSpecification": {
+                "PredefinedMetricType": "ECSServiceAverageMemoryUtilization"
+            },
+            "ScaleInCooldown": int(scale_in_cooldown),
+            "ScaleOutCooldown": int(scale_out_cooldown),
+        },
+    )
+
+
 def create_listener_and_rules(
     elbv2,
     *,

@@ -63,6 +63,7 @@ from tools.dynamodb_infra import (
 )
 from tools.ecs_infra import (
     build_and_push_image,
+    configure_ecs_service_autoscaling,
     create_alb_only,
     create_alb_security_group,
     create_ecs_service,
@@ -189,6 +190,15 @@ def _service_specs(project_root: Path) -> list[dict[str, object]]:
             "memory": "512",
             "desired_count": 3,
             "full_stack_env": True,
+            "autoscaling": {
+                "enabled": True,
+                "min_capacity": 3,
+                "max_capacity": 12,
+                "cpu_target": 70.0,
+                "memory_target": 70.0,
+                "scale_in_cooldown": 120,
+                "scale_out_cooldown": 45,
+            },
         },
         {
             "id": "tracking",
@@ -200,6 +210,15 @@ def _service_specs(project_root: Path) -> list[dict[str, object]]:
             "memory": "1024",
             "desired_count": 6,
             "full_stack_env": True,
+            "autoscaling": {
+                "enabled": True,
+                "min_capacity": 6,
+                "max_capacity": 24,
+                "cpu_target": 60.0,
+                "memory_target": 70.0,
+                "scale_in_cooldown": 120,
+                "scale_out_cooldown": 45,
+            },
         },
         {
             "id": "routing",
@@ -212,8 +231,50 @@ def _service_specs(project_root: Path) -> list[dict[str, object]]:
             "desired_count": 3,
             "full_stack_env": False,
             "health_check_grace_seconds": 600,
+            "autoscaling": {
+                "enabled": True,
+                "min_capacity": 3,
+                "max_capacity": 12,
+                "cpu_target": 75.0,
+                "memory_target": 80.0,
+                "scale_in_cooldown": 180,
+                "scale_out_cooldown": 60,
+            },
         },
     ]
+
+
+def _configure_service_autoscaling_if_enabled(
+    app_autoscaling,
+    *,
+    cluster_name: str,
+    service_name: str,
+    spec: dict[str, object],
+) -> None:
+    autoscaling = spec.get("autoscaling")
+    if not isinstance(autoscaling, dict):
+        return
+    if not bool(autoscaling.get("enabled", False)):
+        return
+    configure_ecs_service_autoscaling(
+        app_autoscaling,
+        cluster_name=cluster_name,
+        service_name=service_name,
+        min_capacity=int(autoscaling["min_capacity"]),
+        max_capacity=int(autoscaling["max_capacity"]),
+        cpu_target=float(autoscaling["cpu_target"]),
+        memory_target=float(autoscaling["memory_target"]),
+        scale_in_cooldown=int(autoscaling.get("scale_in_cooldown", 120)),
+        scale_out_cooldown=int(autoscaling.get("scale_out_cooldown", 45)),
+    )
+    print(
+        "  [ASG] Autoscaling configured for "
+        f"{service_name} "
+        f"(min={int(autoscaling['min_capacity'])}, "
+        f"max={int(autoscaling['max_capacity'])}, "
+        f"cpu_target={float(autoscaling['cpu_target'])}, "
+        f"memory_target={float(autoscaling['memory_target'])})"
+    )
 
 
 def _spec_for_id(specs: list[dict[str, object]], service_id: str) -> dict[str, object]:
@@ -272,6 +333,7 @@ def redeploy_single_service(
     session = boto3.Session(region_name=region)
     sts = session.client("sts")
     ecs = session.client("ecs")
+    app_autoscaling = session.client("application-autoscaling")
     ecr = session.client("ecr")
     logs = session.client("logs")
     account_id = sts.get_caller_identity()["Account"]
@@ -398,6 +460,12 @@ def redeploy_single_service(
         task_definition_arn=td_arn,
         health_check_grace_period_seconds=grace,
         desired_count=(int(spec["desired_count"]) if apply_service_spec else None),
+    )
+    _configure_service_autoscaling_if_enabled(
+        app_autoscaling,
+        cluster_name=state.cluster_name,
+        service_name=rec.service_name,
+        spec=spec,
     )
     wait_for_service_stable(ecs, state.cluster_name, rec.service_name)
     write_connection_env(state, base_url, region, quiet=False)
@@ -582,6 +650,7 @@ def main() -> None:
     sts = session.client("sts")
     elbv2 = session.client("elbv2")
     ecs = session.client("ecs")
+    app_autoscaling = session.client("application-autoscaling")
     ecr = session.client("ecr")
     iam = session.client("iam")
     logs = session.client("logs")
@@ -833,6 +902,12 @@ def main() -> None:
                         spec.get("health_check_grace_seconds", 120)
                     ),
                 )
+                _configure_service_autoscaling_if_enabled(
+                    app_autoscaling,
+                    cluster_name=cluster,
+                    service_name=rec.service_name,
+                    spec=spec,
+                )
                 wait_for_service_stable(ecs, cluster, rec.service_name)
                 _snapshot_connection_env(state, alb_base_url, region=deploy_region)
 
@@ -921,6 +996,12 @@ def main() -> None:
                     health_check_grace_period_seconds=int(
                         spec.get("health_check_grace_seconds", 120)
                     ),
+                )
+                _configure_service_autoscaling_if_enabled(
+                    app_autoscaling,
+                    cluster_name=cluster,
+                    service_name=svc_name,
+                    spec=spec,
                 )
                 wait_for_service_stable(ecs, cluster, svc_name)
                 _snapshot_connection_env(
