@@ -2,7 +2,7 @@
 Load RDS fixture data via public POST APIs (no orders).
 
   pip install -r simulator/requirements.txt
-  python -m simulator.data_loader --base-url http://<alb> [--customers 10]
+  python -m simulator.loaders.data_loader --base-url http://<alb> [--customers 10]
 
 Writes dijkfood_sim_state.json (or --state-file) for load_test.
 
@@ -22,9 +22,9 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from .env_load import load_simulator_env
-from .http_client import json_load, request_json
-from .sp_coords import sample_coordinates
+from simulator.shared.env_load import load_simulator_env
+from simulator.shared.http_client import json_load, request_json
+from simulator.loaders.sp_coords import sample_coordinates
 
 
 def _load_state(path: Path) -> dict[str, Any] | None:
@@ -154,7 +154,7 @@ def main() -> None:
     )
     args = p.parse_args()
     if not args.base_url:
-        p.error("Pass --base-url or set BASE_URL in .env / connection.env")
+        p.error("Pass --base-url or set BASE_URL in repo-root .env / connection.env")
 
     try:
         from faker import Faker

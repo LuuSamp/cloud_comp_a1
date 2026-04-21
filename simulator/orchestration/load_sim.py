@@ -2,7 +2,7 @@
 Configurable HTTP load against the deployed API: measures latency and throughput.
 
 Example:
-  python -m simulator.load_sim --base-url http://alb-xxx.us-east-1.elb.amazonaws.com \\
+  python -m simulator.orchestration.load_sim --base-url http://alb-xxx.us-east-1.elb.amazonaws.com \\
       --rate 5 --duration 10
 """
 
@@ -18,7 +18,7 @@ import time
 import urllib.error
 import urllib.request
 
-from .env_load import load_simulator_env
+from simulator.shared.env_load import load_simulator_env
 
 
 def _fetch(url: str, path: str, latencies: list[float], errors: list[str]) -> None:
@@ -96,7 +96,7 @@ def main() -> None:
     p.add_argument(
         "--base-url",
         default=(os.environ.get("BASE_URL") or "").strip(),
-        help="e.g. http://my-alb.us-east-1.elb.amazonaws.com (or BASE_URL in .env / connection.env)",
+        help="e.g. http://my-alb.us-east-1.elb.amazonaws.com (or BASE_URL in repo-root .env / connection.env)",
     )
     p.add_argument("--path", default="/health", help="URL path to request")
     p.add_argument("--rate", type=float, default=10.0, help="Target requests per second per worker")
@@ -104,7 +104,7 @@ def main() -> None:
     p.add_argument("--workers", type=int, default=2, help="Concurrent worker threads")
     args = p.parse_args()
     if not args.base_url:
-        p.error("Pass --base-url or set BASE_URL in .env / connection.env")
+        p.error("Pass --base-url or set BASE_URL in repo-root .env / connection.env")
     sys.exit(run(args))
 
 

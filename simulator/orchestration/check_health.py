@@ -1,8 +1,8 @@
 """
 Probe health endpoints for ordering, routing, and tracking (same ALB by default).
 
-  python -m simulator.check_health --base-url http://<alb>
-  python -m simulator.check_health ... --strict-ready   # fail if routing graph not ready
+  python -m simulator.orchestration.check_health --base-url http://<alb>
+  python -m simulator.orchestration.check_health ... --strict-ready   # fail if routing graph not ready
 """
 
 from __future__ import annotations
@@ -11,8 +11,8 @@ import argparse
 import os
 import sys
 
-from .env_load import load_simulator_env
-from .http_client import request_json
+from simulator.shared.env_load import load_simulator_env
+from simulator.shared.http_client import request_json
 
 
 def main() -> None:
@@ -40,7 +40,7 @@ def main() -> None:
     )
     args = p.parse_args()
     if not args.base_url:
-        p.error("Pass --base-url or set BASE_URL in .env / connection.env")
+        p.error("Pass --base-url or set BASE_URL in repo-root .env / connection.env")
 
     base = args.base_url.rstrip("/")
     routing = (args.routing_base_url or base).rstrip("/")

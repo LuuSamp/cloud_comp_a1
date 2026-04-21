@@ -30,8 +30,8 @@ connection.env
 *.graphml
 **/*.graphml
 
-# Simulator, infra tools, deploy — not COPY'd by ordering/tracking Dockerfiles
-simulator/
+# Simulator images COPY simulator/requirements.txt and simulator/
+# Keep simulator in build context for deploy_simulation.py builds.
 tools/
 download_graph_local.py
 deploy.py
@@ -39,7 +39,6 @@ requirements-deploy.txt
 env.example
 
 # Other ECS services: not needed when context is repo root for ordering/tracking
-services/ordering/
 services/routing/
 
 # Docs and local state

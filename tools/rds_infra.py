@@ -90,7 +90,10 @@ CREATE TABLE IF NOT EXISTS orders (
     order_status_id INT NOT NULL DEFAULT 1 REFERENCES order_statuses(order_status_id),
     customer_id     INT NOT NULL REFERENCES customers(customer_id),
     food_place_id   INT NOT NULL REFERENCES food_places(food_place_id),
-    courier_id      INT REFERENCES couriers(courier_id)
+    courier_id      INT REFERENCES couriers(courier_id),
+    route_status    VARCHAR(32) NOT NULL DEFAULT 'calculating',
+    route_error     TEXT,
+    route_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 )
     """,
 ]
@@ -201,6 +204,12 @@ SCHEMA_MIGRATIONS = [
             ALTER TABLE orders ALTER COLUMN courier_id DROP NOT NULL;
         END IF;
     END $m$;""",
+    """ALTER TABLE orders
+       ADD COLUMN IF NOT EXISTS route_status VARCHAR(32) NOT NULL DEFAULT 'calculating';""",
+    """ALTER TABLE orders
+       ADD COLUMN IF NOT EXISTS route_error TEXT;""",
+    """ALTER TABLE orders
+       ADD COLUMN IF NOT EXISTS route_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();""",
 ]
 
 

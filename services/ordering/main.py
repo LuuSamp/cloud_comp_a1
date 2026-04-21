@@ -68,7 +68,8 @@ def db_check() -> dict[str, str]:
 def dynamo_check() -> dict[str, str]:
     logs_table = os.environ.get("DYNAMODB_ORDER_LOGS_TABLE", "")
     pos_table = os.environ.get("DYNAMODB_COURIER_POSITIONS_TABLE", "")
-    if not logs_table or not pos_table:
+    routes_table = os.environ.get("DYNAMODB_ROUTES_TABLE", "")
+    if not logs_table or not pos_table or not routes_table:
         return {"dynamo": "skipped", "detail": "DynamoDB table env vars unset"}
     region = os.environ.get("AWS_REGION") or os.environ.get(
         "AWS_DEFAULT_REGION", "us-east-1"
@@ -77,6 +78,7 @@ def dynamo_check() -> dict[str, str]:
     try:
         ddb.describe_table(TableName=logs_table)
         ddb.describe_table(TableName=pos_table)
+        ddb.describe_table(TableName=routes_table)
     except ClientError as e:
         return {"dynamo": "error", "detail": str(e)}
     return {"dynamo": "ok"}

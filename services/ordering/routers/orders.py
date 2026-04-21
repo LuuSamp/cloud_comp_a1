@@ -13,6 +13,14 @@ from routing_client import RoutingClientError, nearest_courier
 router = APIRouter(prefix="/orders", tags=["orders"])
 
 
+def _validate_status_courier_pair(order_status_id: int, courier_id: int | None) -> None:
+    if order_status_id >= 4 and courier_id is None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="order_status_id >= 4 requires courier_id",
+        )
+
+
 class OrderCreate(BaseModel):
     customer_id: int
     food_place_id: int
@@ -39,11 +47,13 @@ class OrderOut(BaseModel):
     customer_id: int
     food_place_id: int
     courier_id: int | None
+    route_status: str | None = None
+    route_error: str | None = None
 
 
 _SELECT_ORDER = """
     SELECT o.order_id, o.order_status_id, s.status AS order_status,
-           o.customer_id, o.food_place_id, o.courier_id
+           o.customer_id, o.food_place_id, o.courier_id, o.route_status, o.route_error
     FROM orders o
     JOIN order_statuses s ON s.order_status_id = o.order_status_id
 """
@@ -54,6 +64,7 @@ def create_order(
     body: OrderCreate,
     conn: Annotated[psycopg.Connection, Depends(get_db)],
 ) -> OrderOut:
+    _validate_status_courier_pair(body.order_status_id, body.courier_id)
     courier_id = body.courier_id
     if courier_id is None:
         base = (os.environ.get("ROUTING_BASE_URL") or "").strip()
@@ -176,6 +187,7 @@ def replace_order(
     body: OrderUpdate,
     conn: Annotated[psycopg.Connection, Depends(get_db)],
 ) -> OrderOut:
+    _validate_status_courier_pair(body.order_status_id, body.courier_id)
     with conn.cursor() as cur:
         try:
             cur.execute(

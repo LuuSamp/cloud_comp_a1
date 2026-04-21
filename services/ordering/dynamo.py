@@ -10,6 +10,7 @@ import boto3
 _cached_ddb_resource: Any = None
 _logs_table: Any = None
 _positions_table: Any = None
+_routes_table: Any = None
 
 
 def _region() -> str:
@@ -43,3 +44,13 @@ def get_courier_positions_table() -> Any:
             raise RuntimeError("DYNAMODB_COURIER_POSITIONS_TABLE is not set")
         _positions_table = _get_ddb_resource().Table(name)
     return _positions_table
+
+
+def get_routes_table() -> Any:
+    global _routes_table
+    if _routes_table is None:
+        name = os.environ.get("DYNAMODB_ROUTES_TABLE", "")
+        if not name:
+            raise RuntimeError("DYNAMODB_ROUTES_TABLE is not set")
+        _routes_table = _get_ddb_resource().Table(name)
+    return _routes_table

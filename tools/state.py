@@ -36,8 +36,10 @@ class DeploymentState:
     task_role_arn: str | None = None
     dynamo_order_logs_table: str | None = None
     dynamo_courier_positions_table: str | None = None
+    dynamo_routes_table: str | None = None
     dynamo_order_logs_arn: str | None = None
     dynamo_courier_positions_arn: str | None = None
+    dynamo_routes_arn: str | None = None
     routing_graph_s3_bucket: str | None = None
     created_sg_ids: list[str] = field(default_factory=list)
 

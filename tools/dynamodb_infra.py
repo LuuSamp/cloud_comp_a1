@@ -27,9 +27,10 @@ def _tag_table(ddb, table_arn: str, suffix: str) -> None:
         pass
 
 
-def create_dynamodb_tables(ddb, suffix: str, state: DeploymentState) -> tuple[str, str]:
+def create_dynamodb_tables(ddb, suffix: str, state: DeploymentState) -> tuple[str, str, str]:
     order_logs = f"dijkfood-order-logs-{suffix}"
     courier_pos = f"dijkfood-courier-positions-{suffix}"
+    routes = f"dijkfood-routes-{suffix}"
 
     try:
         r1 = ddb.create_table(
@@ -85,20 +86,49 @@ def create_dynamodb_tables(ddb, suffix: str, state: DeploymentState) -> tuple[st
             "(if schema changed, delete the table or use a new suffix)"
         )
 
+    try:
+        r3 = ddb.create_table(
+            TableName=routes,
+            KeySchema=[
+                {"AttributeName": "routeKey", "KeyType": "HASH"},
+            ],
+            AttributeDefinitions=[
+                {"AttributeName": "routeKey", "AttributeType": "S"},
+            ],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        arn3 = r3["TableDescription"]["TableArn"]
+        ddb.get_waiter("table_exists").wait(TableName=routes)
+        _tag_table(ddb, arn3, suffix)
+        print(f"  [DynamoDB] Table {routes}")
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "ResourceInUseException":
+            raise
+        d = ddb.describe_table(TableName=routes)
+        arn3 = d["Table"]["TableArn"]
+        print(
+            f"  [DynamoDB] Table {routes} exists "
+            "(if schema changed, delete the table or use a new suffix)"
+        )
+
     state.dynamo_order_logs_table = order_logs
     state.dynamo_courier_positions_table = courier_pos
     state.dynamo_order_logs_arn = arn1
     state.dynamo_courier_positions_arn = arn2
-    return order_logs, courier_pos
+    state.dynamo_routes_table = routes
+    state.dynamo_routes_arn = arn3
+    return order_logs, courier_pos, routes
 
 
 def attach_dynamo_policy_to_task_role(
-    iam, task_role_name: str, order_logs_arn: str, courier_positions_arn: str
+    iam, task_role_name: str, order_logs_arn: str, courier_positions_arn: str, routes_arn: str
 ) -> None:
     resources = [
         order_logs_arn,
         f"{order_logs_arn}/index/*",
         courier_positions_arn,
+        routes_arn,
+        f"{routes_arn}/index/*",
     ]
     doc = {
         "Version": "2012-10-17",
@@ -129,7 +159,7 @@ def attach_dynamo_policy_to_task_role(
 
 
 def destroy_dynamodb_tables(ddb, state: DeploymentState) -> None:
-    for attr in ("dynamo_order_logs_table", "dynamo_courier_positions_table"):
+    for attr in ("dynamo_order_logs_table", "dynamo_courier_positions_table", "dynamo_routes_table"):
         name = getattr(state, attr)
         if not name:
             continue
@@ -142,3 +172,4 @@ def destroy_dynamodb_tables(ddb, state: DeploymentState) -> None:
         setattr(state, attr, None)
     state.dynamo_order_logs_arn = None
     state.dynamo_courier_positions_arn = None
+    state.dynamo_routes_arn = None

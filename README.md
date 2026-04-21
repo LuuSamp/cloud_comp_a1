@@ -35,10 +35,10 @@ After a successful deploy, install simulator deps and run tools **manually** (no
 
 ```bash
 pip install -r simulator/requirements.txt
-python -m simulator.check_health --base-url "http://$(grep '^BASE_URL=' connection.env | cut -d= -f2-)"
-python -m simulator.data_loader --base-url "http://<your-alb-dns>" --customers 10
-python -m simulator.load_test --base-url "http://<your-alb-dns>" --rate 3 --duration 30 --workers 2
-python -m simulator.load_sim --base-url "http://<your-alb-dns>" --path /health --rate 10 --duration 15
+python -m simulator.orchestration.check_health --base-url "http://$(grep '^BASE_URL=' connection.env | cut -d= -f2-)"
+python -m simulator.loaders.data_loader --base-url "http://<your-alb-dns>" --customers 10
+python -m simulator.orchestration.load_test --base-url "http://<your-alb-dns>" --rate 3 --duration 30 --workers 2
+python -m simulator.orchestration.load_sim --base-url "http://<your-alb-dns>" --path /health --rate 10 --duration 15
 ```
 
 - **Ordering** (full API): default ALB target (`/health`, `/customers`, …). **`POST /orders`** uses **`order_status_id`** (1–6); **`courier_id`** may be omitted when **`ROUTING_BASE_URL`** is set (nearest idle courier by drive distance using lat/**lon** / initial coordinates). Placeholder workflow routes under **`/sim/*`** return **501** until you implement them; the load test falls back to **`POST /orders`**, **`PUT /orders/{id}`**, and **`POST /order-logs`**.
@@ -68,21 +68,21 @@ python -m simulator.load_sim --base-url "http://<your-alb-dns>" --path /health -
 
 Install once: `pip install -r simulator/requirements.txt` (Faker for the data loader). The load test expects **RDS + DynamoDB** schemas matching this repo (composite order logs, courier positions with `lat`/`lon`, etc.).
 
-Simulator commands load **[`.env`](.env)** first, then **[`connection.env`](connection.env)** if it exists ([`simulator/env_load.py`](simulator/env_load.py)). Duplicate keys keep the value from `.env` so you can override the deploy snapshot locally. **`BASE_URL`** from `connection.env` (written by `deploy.py`) is picked up automatically—no need to pass `--base-url` if it is set.
+Simulator commands load **[`.env`](.env)** first, then **[`connection.env`](connection.env)** if it exists ([`simulator/shared/env_load.py`](simulator/shared/env_load.py)). Duplicate keys keep the value from `.env` so you can override the deploy snapshot locally. **`BASE_URL`** from `connection.env` (written by `deploy.py`) is picked up automatically—no need to pass `--base-url` if it is set.
 
 | Module | Purpose |
 |--------|---------|
-| [`simulator/check_health.py`](simulator/check_health.py) | `GET` ordering `/health`, routing `/routing/health` + `/routing/ready`, tracking `/tracking/health`. **`--strict-ready`** fails if the routing graph is not ready (503). |
-| [`simulator/data_loader.py`](simulator/data_loader.py) | **Faker**-backed **POST** of customers, food places, and **3×** couriers (configurable factor); **no orders**. Tries **`GET /routing/v1/random-points`** on `--routing-base-url` (defaults to `--base-url`), else São Paulo **bbox** fallback. Writes **`dijkfood_sim_state.json`** (override with `--state-file`). |
-| [`simulator/load_test.py`](simulator/load_test.py) | Scenario load using the state file: **`simulate_user_order`** (`/sim/orders/place` or fallback **`POST /orders`**), **`simulate_courier_position_report`**, **`simulate_order_status_progress`** (`/sim/orders/{id}/transition` or fallback **PUT + order-logs + GET**). **`--routing-base-url`** / **`ROUTING_BASE_URL`** enables omitting **`courier_id`** on fallback creates. |
-| [`simulator/load_sim.py`](simulator/load_sim.py) | Lightweight **GET** traffic (default `/health`). |
-| [`simulator/http_client.py`](simulator/http_client.py), [`simulator/sp_coords.py`](simulator/sp_coords.py), [`simulator/scenarios.py`](simulator/scenarios.py), [`simulator/env_load.py`](simulator/env_load.py) | Shared HTTP, coordinates, scenario steps, env loading. |
+| [`simulator/orchestration/check_health.py`](simulator/orchestration/check_health.py) | `GET` ordering `/health`, routing `/routing/health` + `/routing/ready`, tracking `/tracking/health`. **`--strict-ready`** fails if the routing graph is not ready (503). |
+| [`simulator/loaders/data_loader.py`](simulator/loaders/data_loader.py) | **Faker**-backed **POST** of customers, food places, and **3×** couriers (configurable factor); **no orders**. Tries **`GET /routing/v1/random-points`** on `--routing-base-url` (defaults to `--base-url`), else São Paulo **bbox** fallback. Writes **`dijkfood_sim_state.json`** (override with `--state-file`). |
+| [`simulator/orchestration/load_test.py`](simulator/orchestration/load_test.py) | Service-mode orchestrator that runs customer/food_place/courier simulation loops together (API discovery via GET; no runtime state-file dependency). |
+| [`simulator/orchestration/load_sim.py`](simulator/orchestration/load_sim.py) | Lightweight **GET** traffic (default `/health`). |
+| [`simulator/shared/http_client.py`](simulator/shared/http_client.py), [`simulator/loaders/sp_coords.py`](simulator/loaders/sp_coords.py), [`simulator/shared/scenarios.py`](simulator/shared/scenarios.py), [`simulator/shared/env_load.py`](simulator/shared/env_load.py) | Shared HTTP, coordinates, scenario steps, env loading. |
 
 ## Microservices layout
 
 | Service | ALB rule | Source | Role (sketch) |
 |---------|-----------|--------|---------------|
-| ordering | default | [`services/ordering/`](services/ordering) (build context: repo root) | Full FastAPI app in [`app/`](app/) |
+| ordering | default | [`services/ordering/`](services/ordering) (build context: repo root) | Full FastAPI app in [`services/ordering/`](services/ordering/) |
 | tracking | `/tracking*` | [`services/tracking/`](services/tracking) | Stub (FastAPI); future courier tracking |
 | routing | `/routing*` | [`services/routing/`](services/routing) | OSMnx street graph + Dijkstra shortest paths (`length` in meters) |
 
@@ -115,8 +115,9 @@ The **ordering** ECS task receives `DYNAMODB_ORDER_LOGS_TABLE`, `DYNAMODB_COURIE
 - [`tools/dynamodb_infra.py`](tools/dynamodb_infra.py) — DynamoDB create/destroy + IAM policy attachment
 - [`tools/s3_routing_graph_infra.py`](tools/s3_routing_graph_infra.py) — S3 bucket for routing graph cache + task-role policy + teardown
 - [`tools/ecs_infra.py`](tools/ecs_infra.py) — ALB, multi-target routing, ECS; teardown does **not** delete IAM roles
-- [`app/`](app/) — FastAPI monolith consumed by **ordering** image; OpenAPI UI at `/docs` on ordering service
-- [`simulator/`](simulator/) — [`check_health`](simulator/check_health.py), [`data_loader`](simulator/data_loader.py), [`load_test`](simulator/load_test.py), [`load_sim`](simulator/load_sim.py); see **Load tools** above
+- [`services/ordering/`](services/ordering/) — FastAPI ordering service source; OpenAPI UI at `/docs`
+- [`simulator/`](simulator/) — simulation service runners + orchestrator; see [`simulator/SERVICES.md`](simulator/SERVICES.md)
+- [`deploy_simulation.py`](deploy_simulation.py) — deploy/redeploy/start/stop/shutdown simulation ECS services independently
 
 ## REST API (per entity)
 

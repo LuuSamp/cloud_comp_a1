@@ -8,6 +8,8 @@ import random
 import re
 import tempfile
 import threading
+import time
+from collections import OrderedDict
 
 import boto3
 import geopandas as gpd
@@ -49,6 +51,14 @@ def graph_s3_object_key(place: str, network_type: str) -> str:
 # OSMnx configures its own HTTP user agent for API etiquette.
 _DEFAULT_PLACE = "São Paulo, SP, Brazil"
 _DEFAULT_NETWORK = "drive"
+_ROUTE_CACHE_MAX_ENTRIES = max(
+    100,
+    int((os.environ.get("ROUTING_ROUTE_CACHE_MAX_ENTRIES") or "5000").strip()),
+)
+_ROUTE_CACHE_TTL_S = max(
+    60.0,
+    float((os.environ.get("ROUTING_ROUTE_CACHE_TTL_S") or "3600").strip()),
+)
 
 
 def _project_point(lng: float, lat: float, crs: str) -> tuple[float, float]:
@@ -56,6 +66,19 @@ def _project_point(lng: float, lat: float, crs: str) -> tuple[float, float]:
     t = pt.to_crs(crs)
     geom = t.iloc[0]
     return float(geom.x), float(geom.y)
+
+
+def _project_points(latlons: list[tuple[float, float]], crs: str) -> tuple[list[float], list[float]]:
+    if not latlons:
+        return [], []
+    pts = gpd.GeoSeries(
+        [Point(lng, lat) for lat, lng in latlons],
+        crs="EPSG:4326",
+    )
+    transformed = pts.to_crs(crs)
+    xs = [float(g.x) for g in transformed]
+    ys = [float(g.y) for g in transformed]
+    return xs, ys
 
 
 class RoutingGraph:
@@ -66,6 +89,10 @@ class RoutingGraph:
         self._G_orig: nx.MultiDiGraph | None = None
         self._G_proj: nx.MultiDiGraph | None = None
         self._load_error: str | None = None
+        self._route_cache_by_pair: OrderedDict[
+            tuple[int, int], dict[str, object]
+        ] = OrderedDict()
+        self._route_cache_by_order: dict[int, tuple[int, int]] = {}
 
     @property
     def ready(self) -> bool:
@@ -184,6 +211,117 @@ class RoutingGraph:
             raise RuntimeError("Graph not loaded")
         return self._G_orig, self._G_proj
 
+    def _prune_route_cache_locked(self, now: float) -> None:
+        # OrderedDict keeps insertion/access order; pop oldest when oversize.
+        while self._route_cache_by_pair:
+            first_key = next(iter(self._route_cache_by_pair))
+            entry = self._route_cache_by_pair[first_key]
+            created_at = float(entry.get("created_at_epoch_s", now))
+            if now - created_at <= _ROUTE_CACHE_TTL_S:
+                break
+            self._route_cache_by_pair.pop(first_key, None)
+            stale_orders = [
+                oid
+                for oid, pair in self._route_cache_by_order.items()
+                if pair == first_key
+            ]
+            for oid in stale_orders:
+                self._route_cache_by_order.pop(oid, None)
+        while len(self._route_cache_by_pair) > _ROUTE_CACHE_MAX_ENTRIES:
+            evicted_pair, _entry = self._route_cache_by_pair.popitem(last=False)
+            stale_orders = [
+                oid
+                for oid, pair in self._route_cache_by_order.items()
+                if pair == evicted_pair
+            ]
+            for oid in stale_orders:
+                self._route_cache_by_order.pop(oid, None)
+
+    def cache_route(
+        self,
+        *,
+        customer_id: int,
+        food_place_id: int,
+        distance_m: float,
+        node_ids: list[int],
+        coordinates: list[dict[str, float]],
+        order_id: int | None = None,
+    ) -> None:
+        pair_key = (food_place_id, customer_id)
+        now = time.time()
+        with self._lock:
+            self._route_cache_by_pair[pair_key] = {
+                "food_place_id": food_place_id,
+                "customer_id": customer_id,
+                "distance_m": float(distance_m),
+                "node_ids": [int(n) for n in node_ids],
+                "coordinates": [
+                    {"lat": float(c["lat"]), "lng": float(c["lng"])}
+                    for c in coordinates
+                ],
+                "created_at_epoch_s": now,
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+            }
+            self._route_cache_by_pair.move_to_end(pair_key, last=True)
+            if order_id is not None:
+                self._route_cache_by_order[int(order_id)] = pair_key
+            self._prune_route_cache_locked(now)
+
+    def get_cached_route_by_pair(
+        self,
+        *,
+        customer_id: int,
+        food_place_id: int,
+    ) -> dict[str, object] | None:
+        pair_key = (food_place_id, customer_id)
+        now = time.time()
+        with self._lock:
+            self._prune_route_cache_locked(now)
+            entry = self._route_cache_by_pair.get(pair_key)
+            if entry is None:
+                return None
+            self._route_cache_by_pair.move_to_end(pair_key, last=True)
+            return {
+                "food_place_id": int(entry["food_place_id"]),
+                "customer_id": int(entry["customer_id"]),
+                "distance_m": float(entry["distance_m"]),
+                "node_ids": [int(n) for n in entry["node_ids"]],  # type: ignore[index]
+                "coordinates": [
+                    {"lat": float(c["lat"]), "lng": float(c["lng"])}
+                    for c in (entry["coordinates"])  # type: ignore[index]
+                ],
+                "created_at": str(entry["created_at"]),
+            }
+
+    def get_cached_route_by_order(
+        self,
+        *,
+        order_id: int,
+    ) -> dict[str, object] | None:
+        now = time.time()
+        with self._lock:
+            self._prune_route_cache_locked(now)
+            pair_key = self._route_cache_by_order.get(int(order_id))
+            if pair_key is None:
+                return None
+            entry = self._route_cache_by_pair.get(pair_key)
+            if entry is None:
+                self._route_cache_by_order.pop(int(order_id), None)
+                return None
+            self._route_cache_by_pair.move_to_end(pair_key, last=True)
+            return {
+                "order_id": int(order_id),
+                "food_place_id": int(entry["food_place_id"]),
+                "customer_id": int(entry["customer_id"]),
+                "distance_m": float(entry["distance_m"]),
+                "node_ids": [int(n) for n in entry["node_ids"]],  # type: ignore[index]
+                "coordinates": [
+                    {"lat": float(c["lat"]), "lng": float(c["lng"])}
+                    for c in (entry["coordinates"])  # type: ignore[index]
+                ],
+                "created_at": str(entry["created_at"]),
+            }
+
     def random_node_latlons(self, n: int) -> list[tuple[float, float]]:
         """Sample up to n (lat, lon) pairs from unprojected graph nodes."""
         Go, _ = self._graphs()
@@ -207,18 +345,47 @@ class RoutingGraph:
         x, y = _project_point(lng, lat, crs_s)
         return ox.distance.nearest_nodes(Gp, x, y)
 
+    def snap_many(self, latlons: list[tuple[float, float]]) -> list[int]:
+        _, Gp = self._graphs()
+        crs = Gp.graph.get("crs")
+        if crs is None:
+            raise RuntimeError("Projected graph has no CRS")
+        xs, ys = _project_points(latlons, str(crs))
+        if not xs:
+            return []
+        nodes = ox.distance.nearest_nodes(Gp, xs, ys)
+        if isinstance(nodes, list):
+            return [int(n) for n in nodes]
+        return [int(n) for n in nodes.tolist()]
+
     def shortest_path(
-        self, o_lat: float, o_lng: float, d_lat: float, d_lng: float
+        self,
+        o_lat: float,
+        o_lng: float,
+        d_lat: float,
+        d_lng: float,
+        *,
+        include_geometry: bool = True,
     ) -> tuple[float, list[int], list[dict[str, float]]]:
         """Return distance (m), node path, coordinates (lat,lng per node)."""
         Go, Gp = self._graphs()
         orig = self.snap(o_lat, o_lng)
         dest = self.snap(d_lat, d_lng)
+        if not include_geometry:
+            dist = float(
+                nx.shortest_path_length(
+                    Gp, orig, dest, weight="length", method="dijkstra"
+                )
+            )
+            return dist, [], []
         path: list[int] = nx.shortest_path(
             Gp, orig, dest, weight="length", method="dijkstra"
         )
         dist = route_length_m(Gp, path)
-        coords = [{"lat": float(Go.nodes[n]["y"]), "lng": float(Go.nodes[n]["x"])} for n in path]
+        coords = [
+            {"lat": float(Go.nodes[n]["y"]), "lng": float(Go.nodes[n]["x"])}
+            for n in path
+        ]
         return dist, path, coords
 
     def nearest_courier_from_restaurant(
@@ -226,6 +393,8 @@ class RoutingGraph:
         r_lat: float,
         r_lng: float,
         candidates: list[tuple[int, float, float]],
+        *,
+        include_geometry: bool = True,
     ) -> tuple[int | None, float | None, list[int] | None, list[dict[str, float]] | None]:
         """
         Single-source Dijkstra from restaurant snap node; pick the reachable candidate
@@ -242,11 +411,9 @@ class RoutingGraph:
         best_id: int | None = None
         best_dist: float | None = None
         best_node: int | None = None
-        for cid, c_lat, c_lng in candidates:
-            try:
-                node = self.snap(c_lat, c_lng)
-            except Exception:
-                continue
+        ids = [cid for cid, _, _ in candidates]
+        nodes = self.snap_many([(lat, lng) for _, lat, lng in candidates])
+        for cid, node in zip(ids, nodes):
             d = lengths.get(node)
             if d is None:
                 continue
@@ -256,9 +423,15 @@ class RoutingGraph:
                 best_node = node
         if best_id is None or best_node is None:
             return None, None, None, None
-        path: list[int] = nx.shortest_path(
-            Gp, source, best_node, weight="length", method="dijkstra"
-        )
-        coords = [{"lat": float(Go.nodes[n]["y"]), "lng": float(Go.nodes[n]["x"])} for n in path]
-        dist = route_length_m(Gp, path)
-        return best_id, dist, path, coords
+        if include_geometry:
+            path = nx.shortest_path(
+                Gp, source, best_node, weight="length", method="dijkstra"
+            )
+            coords = [
+                {"lat": float(Go.nodes[n]["y"]), "lng": float(Go.nodes[n]["x"])}
+                for n in path
+            ]
+            dist = route_length_m(Gp, path)
+            return best_id, dist, path, coords
+        assert best_dist is not None
+        return best_id, best_dist, None, None

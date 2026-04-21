@@ -27,8 +27,8 @@ Usage:
   --resume: same ECS fallback after load_connection_env; DB_HOST is in connection.env.
 
 Load testing is separate — after deploy, run e.g.:
-  python -m simulator.load_sim --base-url "http://<alb-dns>"
-  python -m simulator.load_test --base-url "http://<alb-dns>" ...
+  python -m simulator.orchestration.load_sim --base-url "http://<alb-dns>"
+  python -m simulator.orchestration.load_test --base-url "http://<alb-dns>" ...
 """
 
 from __future__ import annotations
@@ -173,6 +173,9 @@ def _hydrate_dynamo_arns(ddb, state: DeploymentState) -> None:
     if state.dynamo_courier_positions_table:
         t = ddb.describe_table(TableName=state.dynamo_courier_positions_table)["Table"]
         state.dynamo_courier_positions_arn = t["TableArn"]
+    if state.dynamo_routes_table:
+        t = ddb.describe_table(TableName=state.dynamo_routes_table)["Table"]
+        state.dynamo_routes_arn = t["TableArn"]
 
 
 SERVICE_IDS = ("ordering", "tracking", "routing")
@@ -226,17 +229,17 @@ def _service_specs(project_root: Path) -> list[dict[str, object]]:
             "docker_context": project_root / "services" / "routing",
             "dockerfile": project_root / "services" / "routing" / "Dockerfile",
             "path_pattern": "/routing*",
-            "cpu": "2048",
-            "memory": "8192",
-            "desired_count": 3,
+            "cpu": "4096",
+            "memory": "16384",
+            "desired_count": 6,
             "full_stack_env": False,
             "health_check_grace_seconds": 600,
             "autoscaling": {
                 "enabled": True,
-                "min_capacity": 3,
-                "max_capacity": 12,
-                "cpu_target": 75.0,
-                "memory_target": 80.0,
+                "min_capacity": 6,
+                "max_capacity": 24,
+                "cpu_target": 50.0,
+                "memory_target": 70.0,
                 "scale_in_cooldown": 180,
                 "scale_out_cooldown": 60,
             },
@@ -387,6 +390,10 @@ def redeploy_single_service(
                 "name": "DYNAMODB_COURIER_POSITIONS_TABLE",
                 "value": state.dynamo_courier_positions_table or "",
             },
+            {
+                "name": "DYNAMODB_ROUTES_TABLE",
+                "value": state.dynamo_routes_table or "",
+            },
         ]
 
     def _routing_environment_redeploy() -> list[dict[str, str]]:
@@ -396,12 +403,20 @@ def redeploy_single_service(
             {"name": "SERVICE_ID", "value": "routing"},
             {"name": "OSMNX_PLACE", "value": "São Paulo, SP, Brazil"},
             {"name": "ROUTING_NETWORK_TYPE", "value": "drive"},
+            {"name": "UVICORN_WORKERS", "value": "4"},
         ]
         if state.routing_graph_s3_bucket:
             env.append(
                 {
                     "name": "ROUTING_GRAPH_S3_BUCKET",
                     "value": state.routing_graph_s3_bucket,
+                }
+            )
+        if state.dynamo_routes_table:
+            env.append(
+                {
+                    "name": "DYNAMODB_ROUTES_TABLE",
+                    "value": state.dynamo_routes_table,
                 }
             )
         return env
@@ -665,7 +680,9 @@ def main() -> None:
     try:
         skip_rds = args.resume and bool(state.rds_instance_id)
         skip_dynamo = args.resume and bool(
-            state.dynamo_order_logs_table and state.dynamo_courier_positions_table
+            state.dynamo_order_logs_table
+            and state.dynamo_courier_positions_table
+            and state.dynamo_routes_table
         )
         skip_s3 = args.resume and bool(state.routing_graph_s3_bucket)
         saved_ecs_records = list(state.ecs_services)
@@ -754,12 +771,14 @@ def main() -> None:
             not using_external_task_role
             and state.dynamo_order_logs_arn
             and state.dynamo_courier_positions_arn
+            and state.dynamo_routes_arn
         ):
             attach_dynamo_policy_to_task_role(
                 iam,
                 task_role_name,
                 state.dynamo_order_logs_arn,
                 state.dynamo_courier_positions_arn,
+                state.dynamo_routes_arn,
             )
         if (
             not using_external_task_role
@@ -798,6 +817,10 @@ def main() -> None:
                     "name": "DYNAMODB_COURIER_POSITIONS_TABLE",
                     "value": state.dynamo_courier_positions_table or "",
                 },
+            {
+                "name": "DYNAMODB_ROUTES_TABLE",
+                "value": state.dynamo_routes_table or "",
+            },
             ]
 
         def _routing_env() -> list[dict[str, str]]:
@@ -807,12 +830,20 @@ def main() -> None:
                 {"name": "SERVICE_ID", "value": "routing"},
                 {"name": "OSMNX_PLACE", "value": "São Paulo, SP, Brazil"},
                 {"name": "ROUTING_NETWORK_TYPE", "value": "drive"},
+                {"name": "UVICORN_WORKERS", "value": "4"},
             ]
             if state.routing_graph_s3_bucket:
                 env.append(
                     {
                         "name": "ROUTING_GRAPH_S3_BUCKET",
                         "value": state.routing_graph_s3_bucket,
+                    }
+                )
+            if state.dynamo_routes_table:
+                env.append(
+                    {
+                        "name": "DYNAMODB_ROUTES_TABLE",
+                        "value": state.dynamo_routes_table,
                     }
                 )
             return env
@@ -914,7 +945,7 @@ def main() -> None:
             print(
                 f"[deploy] All ECS services stable. ALB: {alb_base_url}\n"
                 "[deploy] Run load tests manually, e.g. "
-                f"python -m simulator.load_sim --base-url {alb_base_url}"
+                f"python -m simulator.orchestration.load_sim --base-url {alb_base_url}"
             )
         else:
             print("[deploy] --- Networking / ALB / ECS ---")
@@ -1011,7 +1042,7 @@ def main() -> None:
             print(
                 f"[deploy] All ECS services stable. ALB: http://{alb_dns}\n"
                 "[deploy] Run load tests manually, e.g. "
-                f"python -m simulator.load_sim --base-url http://{alb_dns}"
+                f"python -m simulator.orchestration.load_sim --base-url http://{alb_dns}"
             )
         exit_code = 0
 

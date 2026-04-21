@@ -290,6 +290,10 @@ def create_target_group(
     service_id: str,
 ) -> str:
     tg_name = f"dftg{suffix}-{service_id}"[:32]
+    health_path = "/routing/ready" if service_id == "routing" else "/health"
+    interval_s = 60 if service_id == "routing" else 30
+    healthy_n = 2
+    unhealthy_n = 10 if service_id == "routing" else 5
     tg = elbv2.create_target_group(
         Name=tg_name,
         Protocol="HTTP",
@@ -298,10 +302,10 @@ def create_target_group(
         TargetType="ip",
         HealthCheckEnabled=True,
         HealthCheckProtocol="HTTP",
-        HealthCheckPath="/health",
-        HealthCheckIntervalSeconds=30,
-        HealthyThresholdCount=2,
-        UnhealthyThresholdCount=5,
+        HealthCheckPath=health_path,
+        HealthCheckIntervalSeconds=interval_s,
+        HealthyThresholdCount=healthy_n,
+        UnhealthyThresholdCount=unhealthy_n,
         Tags=_tags(suffix),
     )
     return tg["TargetGroups"][0]["TargetGroupArn"]
@@ -379,6 +383,10 @@ def update_ecs_service_task_definition(
         "service": service,
         "taskDefinition": task_definition_arn,
         "forceNewDeployment": force_new_deployment,
+        "deploymentConfiguration": {
+            "maximumPercent": 200,
+            "minimumHealthyPercent": 100,
+        },
     }
     if health_check_grace_period_seconds is not None:
         kwargs["healthCheckGracePeriodSeconds"] = health_check_grace_period_seconds
@@ -563,6 +571,10 @@ def create_ecs_service(
                 }
             ],
             healthCheckGracePeriodSeconds=health_check_grace_period_seconds,
+            deploymentConfiguration={
+                "maximumPercent": 200,
+                "minimumHealthyPercent": 100,
+            },
             tags=[
                 {"key": "Project", "value": TAG_PROJECT},
                 {"key": "DeploymentId", "value": suffix},
@@ -594,6 +606,8 @@ def wait_for_service_stable(ecs, cluster: str, service: str, timeout_s: int = 60
         desired = s.get("desiredCount", 0)
         pending = s.get("pendingCount", 0)
         print(f"  [ECS] desired={desired} running={running} pending={pending}")
+        if desired == 0 and running == 0 and pending == 0:
+            return
         if running >= desired and desired > 0 and pending == 0:
             # extra wait for ALB health
             time.sleep(15)

@@ -10,7 +10,7 @@ import threading
 import time
 from typing import Any
 
-from .http_client import json_load, request_json
+from simulator.shared.http_client import json_load, request_json
 
 # Ordering nearest-courier can wait on routing for up to ~120s; tracking also POSTs assign on →3.
 ORDER_FLOW_HTTP_TIMEOUT_S = 120.0
@@ -71,6 +71,7 @@ class LoadContext:
         body: dict[str, Any] | None = None,
         *,
         timeout: float = 60.0,
+        quiet_http_statuses: set[int] | None = None,
     ) -> tuple[int, bytes]:
         def on_lat(d: float) -> None:
             with self.lock:
@@ -89,6 +90,7 @@ class LoadContext:
             on_latency=on_lat,
             on_error=on_err,
             debug_http=self.debug_http,
+            quiet_http_statuses=quiet_http_statuses,
         )
 
 
@@ -148,10 +150,16 @@ def simulate_user_order(
 def simulate_courier_position_report(
     ctx: LoadContext,
     courier_id: int,
-    rng: random.Random,
+    rng: random.Random | None = None,
+    *,
+    lat: float | None = None,
+    lon: float | None = None,
 ) -> None:
-    lat = rng.uniform(-23.80, -23.50)
-    lon = rng.uniform(-46.95, -46.35)
+    if lat is None or lon is None:
+        if rng is None:
+            rng = random.Random()
+        lat = rng.uniform(-23.80, -23.50)
+        lon = rng.uniform(-46.95, -46.35)
     ts = int(time.time() * 1000)
     body = {
         "courier_id": courier_id,
@@ -168,12 +176,12 @@ def simulate_order_status_progress(
     order_id: int,
     order_status_by_id: dict[int, int],
     status_lock: threading.Lock,
-) -> bool:
+) -> tuple[bool, int]:
     to = ORDER_FLOW_HTTP_TIMEOUT_S
     with status_lock:
         current = order_status_by_id.get(order_id, 1)
     if current >= 6:
-        return False
+        return False, 200
     next_id = current + 1
 
     code, _ = ctx.req_tracking(
@@ -181,10 +189,11 @@ def simulate_order_status_progress(
         "/update-order-status",
         {"order_id": order_id, "order_status_id": next_id, "detail": "load_test"},
         timeout=to,
+        quiet_http_statuses={409, 503},
     )
     if code != 200 and code != 201:
         _sync_local_order_status(ctx, order_id, order_status_by_id, status_lock, timeout=to)
-        return False
+        return False, code
 
     code_v, raw_v = ctx.req_tracking(
         "GET",
@@ -199,11 +208,11 @@ def simulate_order_status_progress(
             if got == next_id:
                 with status_lock:
                     order_status_by_id[order_id] = next_id
-                return True
+                return True, code
             if got > next_id:
                 with status_lock:
                     order_status_by_id[order_id] = got
-                return True
+                return True, code
 
     code_order, raw_order = ctx.req("GET", f"/orders/{order_id}", timeout=to)
     if code_order == 200:
@@ -214,11 +223,11 @@ def simulate_order_status_progress(
             if got == next_id:
                 with status_lock:
                     order_status_by_id[order_id] = next_id
-                return True
+                return True, code
             if got > next_id:
                 with status_lock:
                     order_status_by_id[order_id] = got
-                return True
+                return True, code
 
     _sync_local_order_status(ctx, order_id, order_status_by_id, status_lock, timeout=to)
-    return False
+    return False, code

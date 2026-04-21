@@ -35,6 +35,7 @@ K_EXEC_ROLE_ARN = "EXECUTION_ROLE_ARN"
 K_TASK_ROLE_ARN = "TASK_ROLE_ARN"
 K_DDB_LOGS = "DYNAMO_ORDER_LOGS_TABLE"
 K_DDB_POS = "DYNAMO_COURIER_POSITIONS_TABLE"
+K_DDB_ROUTES = "DYNAMO_ROUTES_TABLE"
 K_ROUTING_GRAPH_S3 = "ROUTING_GRAPH_S3_BUCKET"
 K_SG_EXTRA = "CREATED_SECURITY_GROUP_IDS"
 
@@ -67,6 +68,7 @@ def write_connection_env(
         (K_TASK_ROLE_ARN, state.task_role_arn),
         (K_DDB_LOGS, state.dynamo_order_logs_table),
         (K_DDB_POS, state.dynamo_courier_positions_table),
+        (K_DDB_ROUTES, state.dynamo_routes_table),
         (K_ROUTING_GRAPH_S3, state.routing_graph_s3_bucket),
     ]
     for k, v in optional:
@@ -133,6 +135,7 @@ def load_connection_env(
     state.task_role_arn = (os.getenv(K_TASK_ROLE_ARN) or "").strip() or None
     state.dynamo_order_logs_table = (os.getenv(K_DDB_LOGS) or "").strip() or None
     state.dynamo_courier_positions_table = (os.getenv(K_DDB_POS) or "").strip() or None
+    state.dynamo_routes_table = (os.getenv(K_DDB_ROUTES) or "").strip() or None
     state.routing_graph_s3_bucket = (os.getenv(K_ROUTING_GRAPH_S3) or "").strip() or None
     if raw_svcs_early:
         try:

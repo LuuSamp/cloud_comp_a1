@@ -24,6 +24,7 @@ def request_json(
     on_latency: MetricsHook | None = None,
     on_error: ErrorHook | None = None,
     debug_http: bool = False,
+    quiet_http_statuses: set[int] | None = None,
 ) -> tuple[int, bytes]:
     """
     Perform HTTP request. Returns (status_code, response_body).
@@ -53,13 +54,15 @@ def request_json(
             raw_err = b""
         if on_latency:
             on_latency(dt)
-        if on_error:
+        is_quiet = e.code in (quiet_http_statuses or set())
+        if on_error and not is_quiet:
             on_error(f"{method} {url} HTTP {e.code}")
-        print(
-            f"[http_client] HTTP {e.code} {method} {url}",
-            file=sys.stderr,
-            flush=True,
-        )
+        if not is_quiet:
+            print(
+                f"[http_client] HTTP {e.code} {method} {url}",
+                file=sys.stderr,
+                flush=True,
+            )
         if debug_http:
             snippet = raw_err.decode("utf-8", errors="replace")[:4000]
             if snippet.strip():
