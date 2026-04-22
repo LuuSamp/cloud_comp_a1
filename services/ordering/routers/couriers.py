@@ -10,6 +10,8 @@ from database import get_db
 
 router = APIRouter(prefix="/couriers", tags=["couriers"])
 
+_BULK_MAX = 2000
+
 
 class CourierCreate(BaseModel):
     name: str
@@ -40,6 +42,25 @@ class CourierOut(BaseModel):
     last_position: str | None = None
     initial_lat: float
     initial_lon: float
+
+
+class BulkIds(BaseModel):
+    ids: list[int] = Field(..., max_length=_BULK_MAX)
+
+
+class BulkDeleteOut(BaseModel):
+    deleted_ids: list[int]
+    not_found_ids: list[int]
+
+
+class CouriersBulkIn(BaseModel):
+    items: list[CourierCreate] = Field(..., max_length=_BULK_MAX)
+
+
+class ClearTableOut(BaseModel):
+    ok: bool = True
+    orders_courier_id_nulled: int
+    table_truncated: str
 
 
 @router.post("", response_model=CourierOut, status_code=status.HTTP_201_CREATED)
@@ -96,6 +117,95 @@ def list_couriers(
         )
         rows = cur.fetchall()
     return [CourierOut(**r) for r in rows]
+
+
+@router.post("/bulk", response_model=list[CourierOut], status_code=status.HTTP_201_CREATED)
+def bulk_create_couriers(
+    body: CouriersBulkIn,
+    conn: Annotated[psycopg.Connection, Depends(get_db)],
+) -> list[CourierOut]:
+    if not body.items:
+        return []
+    fragments: list[str] = []
+    params: dict[str, object] = {}
+    for idx, item in enumerate(body.items):
+        p = f"i{idx}_"
+        fragments.append(
+            f"(%({p}name)s, %({p}vehicle_type)s::vehicle_type_t, %({p}initial_address)s, "
+            f"%({p}status)s::courier_status_t, %({p}last_position)s, %({p}initial_lat)s, %({p}initial_lon)s)"
+        )
+        d = item.model_dump()
+        params[f"{p}name"] = d["name"]
+        params[f"{p}vehicle_type"] = d["vehicle_type"]
+        params[f"{p}initial_address"] = d["initial_address"]
+        params[f"{p}status"] = d["status"]
+        params[f"{p}last_position"] = d["last_position"]
+        params[f"{p}initial_lat"] = d["initial_lat"]
+        params[f"{p}initial_lon"] = d["initial_lon"]
+    sql = (
+        """
+        INSERT INTO couriers (
+            name, vehicle_type, initial_address, status,
+            last_position, initial_lat, initial_lon
+        ) VALUES
+        """
+        + ", ".join(fragments)
+        + """
+        RETURNING courier_id, name, vehicle_type::text, initial_address,
+                  status::text, last_position, initial_lat, initial_lon
+        """
+    )
+    with conn.cursor() as cur:
+        try:
+            cur.execute(sql, params)
+        except psycopg.errors.InvalidTextRepresentation as e:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                detail="Invalid vehicle_type or status for PostgreSQL enums",
+            ) from e
+        rows = cur.fetchall()
+    return [CourierOut(**r) for r in rows]
+
+
+@router.post("/bulk-delete", response_model=BulkDeleteOut)
+def bulk_delete_couriers(
+    body: BulkIds,
+    conn: Annotated[psycopg.Connection, Depends(get_db)],
+) -> BulkDeleteOut:
+    ids = list(dict.fromkeys(body.ids))
+    if not ids:
+        return BulkDeleteOut(deleted_ids=[], not_found_ids=[])
+    with conn.cursor() as cur:
+        try:
+            cur.execute(
+                """
+                DELETE FROM couriers
+                WHERE courier_id = ANY(%(ids)s::int[])
+                RETURNING courier_id
+                """,
+                {"ids": ids},
+            )
+        except psycopg.errors.ForeignKeyViolation as e:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail="One or more couriers are still referenced by orders",
+            ) from e
+        deleted = [int(r["courier_id"]) for r in cur.fetchall()]
+    ds = set(deleted)
+    not_found = sorted(i for i in ids if i not in ds)
+    return BulkDeleteOut(deleted_ids=sorted(deleted), not_found_ids=not_found)
+
+
+@router.post("/clear-all", response_model=ClearTableOut)
+def clear_all_couriers(
+    conn: Annotated[psycopg.Connection, Depends(get_db)],
+) -> ClearTableOut:
+    """Null courier_id on all orders, then truncate couriers."""
+    with conn.cursor() as cur:
+        cur.execute("UPDATE orders SET courier_id = NULL WHERE courier_id IS NOT NULL")
+        n = cur.rowcount if cur.rowcount is not None else 0
+        cur.execute("TRUNCATE couriers RESTART IDENTITY")
+    return ClearTableOut(orders_courier_id_nulled=n, table_truncated="couriers")
 
 
 @router.get("/{courier_id}", response_model=CourierOut)

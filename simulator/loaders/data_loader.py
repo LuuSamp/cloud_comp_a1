@@ -93,35 +93,60 @@ def _delete_tracked_entities(base_url: str, state: dict[str, Any]) -> None:
             break
         skip += page_limit
 
-    for oid in sorted(set(order_ids), reverse=True):
-        code, _ = request_json(base_url, "DELETE", f"/orders/{oid}", timeout=60.0)
-        if code not in (204, 404):
+    uniq_orders = sorted(set(order_ids))
+    if uniq_orders:
+        code, raw = request_json(
+            base_url,
+            "POST",
+            "/orders/bulk-delete",
+            body={"order_ids": uniq_orders},
+            timeout=120.0,
+        )
+        if code != 200:
             print(
-                f"[data_loader] DELETE /orders/{oid} -> HTTP {code}",
+                f"[data_loader] POST /orders/bulk-delete failed HTTP {code}: {raw[:500]!r}",
                 file=sys.stderr,
             )
 
-    for coid in sorted(couriers, reverse=True):
-        code, _ = request_json(base_url, "DELETE", f"/couriers/{coid}", timeout=60.0)
-        if code not in (204, 404):
+    if couriers:
+        code, raw = request_json(
+            base_url,
+            "POST",
+            "/couriers/bulk-delete",
+            body={"ids": sorted(couriers)},
+            timeout=120.0,
+        )
+        if code != 200:
             print(
-                f"[data_loader] DELETE /couriers/{coid} -> HTTP {code}",
+                f"[data_loader] POST /couriers/bulk-delete failed HTTP {code}: {raw[:500]!r}",
                 file=sys.stderr,
             )
 
-    for fid in sorted(foods, reverse=True):
-        code, _ = request_json(base_url, "DELETE", f"/food-places/{fid}", timeout=60.0)
-        if code not in (204, 404):
+    if foods:
+        code, raw = request_json(
+            base_url,
+            "POST",
+            "/food-places/bulk-delete",
+            body={"ids": sorted(foods)},
+            timeout=120.0,
+        )
+        if code != 200:
             print(
-                f"[data_loader] DELETE /food-places/{fid} -> HTTP {code}",
+                f"[data_loader] POST /food-places/bulk-delete failed HTTP {code}: {raw[:500]!r}",
                 file=sys.stderr,
             )
 
-    for cid in sorted(customers, reverse=True):
-        code, raw = request_json(base_url, "DELETE", f"/customers/{cid}", timeout=60.0)
-        if code not in (204, 404):
+    if customers:
+        code, raw = request_json(
+            base_url,
+            "POST",
+            "/customers/bulk-delete",
+            body={"ids": sorted(customers)},
+            timeout=120.0,
+        )
+        if code != 200:
             print(
-                f"[data_loader] DELETE /customers/{cid} -> HTTP {code}: {raw[:200]!r}",
+                f"[data_loader] POST /customers/bulk-delete failed HTTP {code}: {raw[:500]!r}",
                 file=sys.stderr,
             )
 
@@ -194,55 +219,94 @@ def main() -> None:
 
     run_id = uuid.uuid4().hex[:8]
 
+    customer_items: list[dict[str, Any]] = []
     for i in range(n_c):
         lat, lon = next_coord()
         suffix = f"{run_id}-{i}"
         email = f"sim.{suffix}@dijkfood.invalid"
-        body = {
-            "name": fake.name(),
-            "email": email,
-            "phone": fake.phone_number()[:32] or "555-0000",
-            "address": fake.address().replace("\n", ", ")[:500],
-            "lat": lat,
-            "lon": lon,
-        }
-        code, raw = request_json(args.base_url, "POST", "/customers", body=body, timeout=60.0)
-        if code != 201:
-            print(f"POST /customers failed HTTP {code}: {raw[:500]!r}", file=sys.stderr)
-            sys.exit(1)
-        customer_ids.append(int(json_load(raw)["customer_id"]))
+        customer_items.append(
+            {
+                "name": fake.name(),
+                "email": email,
+                "phone": fake.phone_number()[:32] or "555-0000",
+                "address": fake.address().replace("\n", ", ")[:500],
+                "lat": lat,
+                "lon": lon,
+            }
+        )
+    code, raw = request_json(
+        args.base_url,
+        "POST",
+        "/customers/bulk",
+        body={"items": customer_items},
+        timeout=120.0,
+    )
+    if code != 201:
+        print(f"POST /customers/bulk failed HTTP {code}: {raw[:500]!r}", file=sys.stderr)
+        sys.exit(1)
+    cust_rows = json_load(raw)
+    if not isinstance(cust_rows, list):
+        print("[data_loader] unexpected /customers/bulk response", file=sys.stderr)
+        sys.exit(1)
+    customer_ids = [int(r["customer_id"]) for r in cust_rows]
 
+    food_items: list[dict[str, Any]] = []
     for i in range(n_c):
         lat, lon = next_coord()
-        body = {
-            "name": f"{fake.company()[:80]} {run_id}-{i}",
-            "kitchen_type": "UNSPECIFIED",
-            "address": fake.address().replace("\n", ", ")[:500],
-            "lat": lat,
-            "lon": lon,
-        }
-        code, raw = request_json(args.base_url, "POST", "/food-places", body=body, timeout=60.0)
-        if code != 201:
-            print(f"POST /food-places failed HTTP {code}: {raw[:500]!r}", file=sys.stderr)
-            sys.exit(1)
-        food_place_ids.append(int(json_load(raw)["food_place_id"]))
+        food_items.append(
+            {
+                "name": f"{fake.company()[:80]} {run_id}-{i}",
+                "kitchen_type": "UNSPECIFIED",
+                "address": fake.address().replace("\n", ", ")[:500],
+                "lat": lat,
+                "lon": lon,
+            }
+        )
+    code, raw = request_json(
+        args.base_url,
+        "POST",
+        "/food-places/bulk",
+        body={"items": food_items},
+        timeout=120.0,
+    )
+    if code != 201:
+        print(f"POST /food-places/bulk failed HTTP {code}: {raw[:500]!r}", file=sys.stderr)
+        sys.exit(1)
+    fp_rows = json_load(raw)
+    if not isinstance(fp_rows, list):
+        print("[data_loader] unexpected /food-places/bulk response", file=sys.stderr)
+        sys.exit(1)
+    food_place_ids = [int(r["food_place_id"]) for r in fp_rows]
 
+    courier_items: list[dict[str, Any]] = []
     for i in range(n_couriers):
         status = "offline" if i % 2 == 0 else "available"
         lat, lon = next_coord()
-        body = {
-            "name": f"Courier {fake.first_name()} {run_id}-{i}",
-            "vehicle_type": "UNSPECIFIED",
-            "initial_address": fake.street_address()[:255],
-            "status": status,
-            "initial_lat": lat,
-            "initial_lon": lon,
-        }
-        code, raw = request_json(args.base_url, "POST", "/couriers", body=body, timeout=60.0)
-        if code != 201:
-            print(f"POST /couriers failed HTTP {code}: {raw[:500]!r}", file=sys.stderr)
-            sys.exit(1)
-        courier_ids.append(int(json_load(raw)["courier_id"]))
+        courier_items.append(
+            {
+                "name": f"Courier {fake.first_name()} {run_id}-{i}",
+                "vehicle_type": "UNSPECIFIED",
+                "initial_address": fake.street_address()[:255],
+                "status": status,
+                "initial_lat": lat,
+                "initial_lon": lon,
+            }
+        )
+    code, raw = request_json(
+        args.base_url,
+        "POST",
+        "/couriers/bulk",
+        body={"items": courier_items},
+        timeout=120.0,
+    )
+    if code != 201:
+        print(f"POST /couriers/bulk failed HTTP {code}: {raw[:500]!r}", file=sys.stderr)
+        sys.exit(1)
+    c_rows = json_load(raw)
+    if not isinstance(c_rows, list):
+        print("[data_loader] unexpected /couriers/bulk response", file=sys.stderr)
+        sys.exit(1)
+    courier_ids = [int(r["courier_id"]) for r in c_rows]
 
     prev_runs: list[Any] = []
     if previous and isinstance(previous.get("meta"), dict):

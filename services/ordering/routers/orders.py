@@ -12,6 +12,8 @@ from routing_client import RoutingClientError, nearest_courier
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
+_BULK_MAX = 5000
+
 
 def _validate_status_courier_pair(order_status_id: int, courier_id: int | None) -> None:
     if order_status_id >= 4 and courier_id is None:
@@ -49,6 +51,15 @@ class OrderOut(BaseModel):
     courier_id: int | None
     route_status: str | None = None
     route_error: str | None = None
+
+
+class OrderBulkDeleteIn(BaseModel):
+    order_ids: list[int] = Field(..., max_length=_BULK_MAX)
+
+
+class OrderBulkDeleteOut(BaseModel):
+    deleted_ids: list[int]
+    not_found_ids: list[int]
 
 
 _SELECT_ORDER = """
@@ -166,6 +177,29 @@ def list_orders(
         )
         rows = cur.fetchall()
     return [OrderOut(**r) for r in rows]
+
+
+@router.post("/bulk-delete", response_model=OrderBulkDeleteOut)
+def bulk_delete_orders(
+    body: OrderBulkDeleteIn,
+    conn: Annotated[psycopg.Connection, Depends(get_db)],
+) -> OrderBulkDeleteOut:
+    ids = list(dict.fromkeys(body.order_ids))
+    if not ids:
+        return OrderBulkDeleteOut(deleted_ids=[], not_found_ids=[])
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM orders
+            WHERE order_id = ANY(%(ids)s::int[])
+            RETURNING order_id
+            """,
+            {"ids": ids},
+        )
+        deleted = [int(r["order_id"]) for r in cur.fetchall()]
+    ds = set(deleted)
+    not_found = sorted(i for i in ids if i not in ds)
+    return OrderBulkDeleteOut(deleted_ids=sorted(deleted), not_found_ids=not_found)
 
 
 @router.get("/{order_id}", response_model=OrderOut)

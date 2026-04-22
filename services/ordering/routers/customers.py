@@ -10,6 +10,8 @@ from database import get_db
 
 router = APIRouter(prefix="/customers", tags=["customers"])
 
+_BULK_MAX = 2000
+
 
 class CustomerCreate(BaseModel):
     name: str
@@ -37,6 +39,25 @@ class CustomerOut(BaseModel):
     address: str
     lat: float
     lon: float
+
+
+class BulkIds(BaseModel):
+    ids: list[int] = Field(..., description="Customer IDs to delete", max_length=_BULK_MAX)
+
+
+class BulkDeleteOut(BaseModel):
+    deleted_ids: list[int]
+    not_found_ids: list[int]
+
+
+class CustomersBulkIn(BaseModel):
+    items: list[CustomerCreate] = Field(..., max_length=_BULK_MAX)
+
+
+class ClearTableOut(BaseModel):
+    ok: bool = True
+    orders_deleted: int
+    table_truncated: str
 
 
 @router.post("", response_model=CustomerOut, status_code=status.HTTP_201_CREATED)
@@ -81,6 +102,80 @@ def list_customers(
         )
         rows = cur.fetchall()
     return [CustomerOut(**r) for r in rows]
+
+
+@router.post("/bulk", response_model=list[CustomerOut], status_code=status.HTTP_201_CREATED)
+def bulk_create_customers(
+    body: CustomersBulkIn,
+    conn: Annotated[psycopg.Connection, Depends(get_db)],
+) -> list[CustomerOut]:
+    if not body.items:
+        return []
+    cols = ("name", "email", "phone", "address", "lat", "lon")
+    fragments: list[str] = []
+    params: dict[str, object] = {}
+    for idx, item in enumerate(body.items):
+        p = f"i{idx}_"
+        fragments.append(
+            f"(%({p}name)s, %({p}email)s, %({p}phone)s, %({p}address)s, %({p}lat)s, %({p}lon)s)"
+        )
+        d = item.model_dump()
+        for c in cols:
+            params[f"{p}{c}"] = d[c]
+    sql = (
+        f"INSERT INTO customers ({', '.join(cols)}) VALUES {', '.join(fragments)} "
+        "RETURNING customer_id, name, email, phone, address, lat, lon"
+    )
+    with conn.cursor() as cur:
+        try:
+            cur.execute(sql, params)
+        except psycopg.errors.UniqueViolation as e:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, detail="Duplicate email in bulk insert"
+            ) from e
+        rows = cur.fetchall()
+    return [CustomerOut(**r) for r in rows]
+
+
+@router.post("/bulk-delete", response_model=BulkDeleteOut)
+def bulk_delete_customers(
+    body: BulkIds,
+    conn: Annotated[psycopg.Connection, Depends(get_db)],
+) -> BulkDeleteOut:
+    ids = list(dict.fromkeys(body.ids))
+    if not ids:
+        return BulkDeleteOut(deleted_ids=[], not_found_ids=[])
+    with conn.cursor() as cur:
+        try:
+            cur.execute(
+                """
+                DELETE FROM customers
+                WHERE customer_id = ANY(%(ids)s::int[])
+                RETURNING customer_id
+                """,
+                {"ids": ids},
+            )
+        except psycopg.errors.ForeignKeyViolation as e:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail="One or more customers are still referenced by orders",
+            ) from e
+        deleted = [int(r["customer_id"]) for r in cur.fetchall()]
+    deleted_set = set(deleted)
+    not_found = sorted(i for i in ids if i not in deleted_set)
+    return BulkDeleteOut(deleted_ids=sorted(deleted), not_found_ids=not_found)
+
+
+@router.post("/clear-all", response_model=ClearTableOut)
+def clear_all_customers(
+    conn: Annotated[psycopg.Connection, Depends(get_db)],
+) -> ClearTableOut:
+    """Delete all orders, then truncate customers (restarts identity)."""
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM orders")
+        n_orders = cur.rowcount if cur.rowcount is not None else 0
+        cur.execute("TRUNCATE customers RESTART IDENTITY")
+    return ClearTableOut(orders_deleted=n_orders, table_truncated="customers")
 
 
 @router.get("/{customer_id}", response_model=CustomerOut)
