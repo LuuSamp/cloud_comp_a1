@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Usage monitoring — DijkFood Agent</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="header">
+        <div class="header-title">
+          <h1>Usage monitoring</h1>
+          <p class="subtitle">Bedrock tokens and request volume (shared across all users)</p>
+        </div>
+        <nav class="nav-tabs" aria-label="Agent UI">
+          <a href="index.html" class="nav-tab">Chat</a>
+          <a href="monitor.html" class="nav-tab active" aria-current="page">Monitoring</a>
+        </nav>
+      </header>
+
+      <section class="settings" aria-label="Connection settings">
+        <label class="field">
+          <span>Agent API base URL</span>
+          <input
+            type="url"
+            id="api-base"
+            placeholder="http://localhost:8003"
+            autocomplete="off"
+          />
+        </label>
+        <span id="health-pill" class="health-pill" title="API health">—</span>
+        <button type="button" id="btn-refresh" class="btn btn-secondary">Refresh</button>
+      </section>
+
+      <div id="alert-banner" class="alert-banner hidden" role="alert"></div>
+
+      <section class="monitor-meta" id="monitor-meta" aria-live="polite"></section>
+
+      <section class="stats-grid" id="stats-grid" aria-label="Usage totals"></section>
+
+      <section class="budget-section hidden" id="budget-section" aria-label="Budget usage">
+        <h2 class="section-title">Budget</h2>
+        <div class="budget-bars" id="budget-bars"></div>
+      </section>
+
+      <section class="daily-section" aria-label="Daily breakdown">
+        <h2 class="section-title">Last 7 days</h2>
+        <div class="table-wrap">
+          <table class="usage-table" id="daily-table">
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Requests</th>
+                <th>Tokens</th>
+                <th>In / Out</th>
+                <th>Bedrock calls</th>
+                <th>Tool calls</th>
+              </tr>
+            </thead>
+            <tbody id="daily-body"></tbody>
+          </table>
+        </div>
+        <p class="hint hidden" id="daily-empty">
+          No usage recorded yet. Send a chat message to start accumulating metrics.
+        </p>
+      </section>
+
+      <p class="hint monitor-footer">
+        Counters persist in DynamoDB on the agent service. Set
+        <code>AGENT_USAGE_BUDGET_TOKENS</code> and
+        <code>AGENT_USAGE_DAILY_BUDGET_TOKENS</code> in <code>.env.agent</code> to show
+        progress bars. Redeploy the agent after changing budgets.
+      </p>
+    </div>
+
+    <script src="monitor.js" type="module"></script>
+  </body>
+</html>

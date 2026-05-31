@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DijkFood Agent</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="header">
+        <div class="header-title">
+          <h1>DijkFood Agent</h1>
+          <p class="subtitle">Ask about orders, status, routes, and couriers</p>
+        </div>
+        <nav class="nav-tabs" aria-label="Agent UI">
+          <a href="index.html" class="nav-tab active" aria-current="page">Chat</a>
+          <a href="monitor.html" class="nav-tab">Monitoring</a>
+        </nav>
+        <div class="header-actions">
+          <button type="button" id="btn-new-chat" class="btn btn-secondary">New chat</button>
+        </div>
+      </header>
+
+      <section class="settings" aria-label="Connection settings">
+        <label class="field">
+          <span>Agent API base URL</span>
+          <input
+            type="url"
+            id="api-base"
+            placeholder="http://localhost:8003"
+            autocomplete="off"
+          />
+        </label>
+        <span id="health-pill" class="health-pill" title="API health">—</span>
+      </section>
+
+      <main id="messages" class="messages" aria-live="polite"></main>
+
+      <form id="chat-form" class="composer">
+        <textarea
+          id="message-input"
+          rows="2"
+          placeholder="e.g. What is the status of order 42?"
+          required
+        ></textarea>
+        <button type="submit" id="btn-send" class="btn btn-primary">Send</button>
+      </form>
+    </div>
+
+    <template id="tpl-message">
+      <article class="message">
+        <div class="message-meta">
+          <span class="message-role"></span>
+        </div>
+        <div class="message-body"></div>
+        <p class="message-usage hidden"></p>
+        <details class="message-tools hidden">
+          <summary>Tools used</summary>
+          <pre class="tools-json"></pre>
+        </details>
+      </article>
+    </template>
+
+    <script src="app.js" type="module"></script>
+  </body>
+</html>

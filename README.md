@@ -1,6 +1,8 @@
 # DijkFood (cloud_comp_a1)
 
-Automated AWS deployment for the cloud computing assignment: **RDS (PostgreSQL)** for core entities, **DynamoDB** for order logs and courier positions, **three ECR/ECS Fargate services** (**ordering**, **tracking**, **routing**) behind one **ALB** (path-based routing), optional load simulators, and teardown.
+Automated AWS deployment for the cloud computing assignment: **RDS (PostgreSQL)** for core entities, **DynamoDB** for order logs and courier positions, **three ECR/ECS Fargate services** (**ordering**, **tracking**, **routing**) behind one **ALB** (path-based routing) on the **Learner Lab** account, optional load simulators, and teardown.
+
+The **conversational agent** (Bedrock) runs on the **same lab ALB** as the microservices (`--with-agent`). Bedrock API calls use keys from [`.env.agent`](.env.agent.example) only — no ECS/ALB in the credits account.
 
 ## Prerequisites
 
@@ -26,6 +28,19 @@ python deploy.py --skip-teardown   # keep stack; connection.env updated througho
 python deploy.py --teardown-only  # destroy using connection.env (deleted after, unless --keep-connection-env)
 python deploy.py --service routing   # rebuild/push one image and roll ECS (ordering|tracking|routing)
 ```
+
+### Agent (Bedrock keys only; infra on lab)
+
+```bash
+cp .env.agent.example .env.agent   # credits-account API keys + BEDROCK_MODEL_ID
+python deploy.py --skip-teardown --with-agent   # lab stack + agent at /agent/*
+python deploy_agent_ui.py          # optional UI at {BASE_URL}/ui/
+python deploy.py --service agent   # redeploy agent image only
+```
+
+Bedrock credentials are injected as `BEDROCK_*` on the lab ECS task (DynamoDB sessions use the lab task role). Keys in task definitions are visible in the ECS console — course lab only.
+
+`deploy.py` reads Bedrock keys from `.env.agent` **only for the ECS task**; it uses **`.env` or your default AWS profile** for lab infra. Do not `export` Bedrock keys in the shell before deploy, or run `unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY` first.
 
 Use **`--service`** after a successful deploy (with **`connection.env`**) when only one microservice changed. **Ordering** redeploys need **`DIJKFOOD_DB_PASSWORD`** in `.env` (never stored in `connection.env`). **`DB_HOST`** is written on new full deploys; older snapshots can still resolve the host from **`RDS_INSTANCE_ID`**.
 

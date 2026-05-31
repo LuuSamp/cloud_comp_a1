@@ -140,7 +140,10 @@ celerybeat.pid
 
 # Environments
 .env
+.env.agent
+agent_roles.env
 connection.env
+agent_connection.env
 .envrc
 .venv
 env/

@@ -20,6 +20,8 @@ Usage:
   python deploy.py --service ordering   # rebuild/push one service from connection.env
   python deploy.py --service tracking --recreate   # also set desired_count from _service_specs (UpdateService only)
   python deploy.py --resume   # reuse RDS/Dynamo/S3 from connection.env; rebuild ECS (implies --skip-teardown)
+  python deploy.py --skip-teardown --with-agent   # lab stack + agent on same ALB (.env.agent Bedrock keys)
+  python deploy.py --service agent   # redeploy agent only (requires prior --with-agent deploy)
 
   Single-service redeploy uses connection.env (run a full deploy with --skip-teardown first).
   Ordering/tracking redeploy: DIJKFOOD_DB_PASSWORD is optional if the service already runs with
@@ -86,6 +88,18 @@ from tools.s3_routing_graph_infra import (
     create_routing_graph_bucket,
     destroy_routing_graph_bucket,
     upload_routing_graph_seed_if_present,
+)
+from tools.agent_aws import load_agent_dotenv, restore_lab_credentials_for_deploy
+from tools.agent_deploy import (
+    AGENT_SERVICE_ID,
+    agent_service_spec,
+    build_agent_task_environment,
+    require_bedrock_credentials,
+)
+from tools.agent_infra import (
+    attach_agent_sessions_policy,
+    create_agent_sessions_table,
+    destroy_agent_sessions_table,
 )
 from tools.rds_infra import (
     allow_rds_from_ecs_tasks,
@@ -176,13 +190,17 @@ def _hydrate_dynamo_arns(ddb, state: DeploymentState) -> None:
     if state.dynamo_routes_table:
         t = ddb.describe_table(TableName=state.dynamo_routes_table)["Table"]
         state.dynamo_routes_arn = t["TableArn"]
+    if state.dynamo_agent_sessions_table:
+        t = ddb.describe_table(TableName=state.dynamo_agent_sessions_table)["Table"]
+        state.dynamo_agent_sessions_arn = t["TableArn"]
 
 
-SERVICE_IDS = ("ordering", "tracking", "routing")
+BASE_SERVICE_IDS = ("ordering", "tracking", "routing")
+SERVICE_IDS = BASE_SERVICE_IDS + (AGENT_SERVICE_ID,)
 
 
-def _service_specs(project_root: Path) -> list[dict[str, object]]:
-    return [
+def _service_specs(project_root: Path, *, with_agent: bool = False) -> list[dict[str, object]]:
+    specs: list[dict[str, object]] = [
         {
             "id": "ordering",
             "ecr_suffix": "ordering",
@@ -191,11 +209,11 @@ def _service_specs(project_root: Path) -> list[dict[str, object]]:
             "path_pattern": "default",
             "cpu": "256",
             "memory": "512",
-            "desired_count": 3,
+            "desired_count": 1,
             "full_stack_env": True,
             "autoscaling": {
                 "enabled": True,
-                "min_capacity": 3,
+                "min_capacity": 1,
                 "max_capacity": 12,
                 "cpu_target": 50.0,
                 "memory_target": 50.0,
@@ -211,11 +229,11 @@ def _service_specs(project_root: Path) -> list[dict[str, object]]:
             "path_pattern": "/tracking*",
             "cpu": "256",
             "memory": "1024",
-            "desired_count": 6,
+            "desired_count": 1,
             "full_stack_env": True,
             "autoscaling": {
                 "enabled": True,
-                "min_capacity": 6,
+                "min_capacity": 1,
                 "max_capacity": 24,
                 "cpu_target": 50.0,
                 "memory_target": 50.0,
@@ -231,12 +249,12 @@ def _service_specs(project_root: Path) -> list[dict[str, object]]:
             "path_pattern": "/routing*",
             "cpu": "4096",
             "memory": "16384",
-            "desired_count": 6,
+            "desired_count": 1,
             "full_stack_env": False,
             "health_check_grace_seconds": 600,
             "autoscaling": {
                 "enabled": True,
-                "min_capacity": 6,
+                "min_capacity": 1,
                 "max_capacity": 24,
                 "cpu_target": 50.0,
                 "memory_target": 50.0,
@@ -245,6 +263,139 @@ def _service_specs(project_root: Path) -> list[dict[str, object]]:
             },
         },
     ]
+    if with_agent:
+        specs.append(agent_service_spec(project_root))
+    return specs
+
+
+def _agent_deployed(state: DeploymentState) -> bool:
+    return any(r.service_id == AGENT_SERVICE_ID for r in state.ecs_services)
+
+
+def _ensure_agent_dynamodb_and_iam(
+    ddb,
+    iam,
+    suffix: str,
+    state: DeploymentState,
+    *,
+    skip_create: bool,
+    using_external_task_role: bool,
+) -> None:
+    if skip_create and state.dynamo_agent_sessions_table:
+        print("[deploy] --- DynamoDB (agent sessions, resume) ---")
+        _hydrate_dynamo_arns(ddb, state)
+    elif not skip_create:
+        print("[deploy] --- DynamoDB (agent sessions) ---")
+        create_agent_sessions_table(ddb, suffix, state)
+    task_role_name = f"dijkfood-ecs-task-{suffix}"
+    if (
+        not using_external_task_role
+        and state.dynamo_agent_sessions_arn
+    ):
+        attach_agent_sessions_policy(
+            iam, task_role_name, state.dynamo_agent_sessions_arn
+        )
+
+
+def _add_agent_listener_rule(
+    elbv2,
+    *,
+    listener_arn: str,
+    target_group_arn: str,
+    priority: int = 30,
+) -> None:
+    elbv2.create_rule(
+        ListenerArn=listener_arn,
+        Priority=priority,
+        Conditions=[{"Field": "path-pattern", "Values": ["/agent*"]}],
+        Actions=[{"Type": "forward", "TargetGroupArn": target_group_arn}],
+    )
+    print(f"  [ALB] Rule /agent* (priority {priority})")
+
+
+def _provision_agent_on_existing_alb(
+    *,
+    project_root: Path,
+    ecs,
+    elbv2,
+    ecr,
+    logs,
+    app_autoscaling,
+    deploy_region: str,
+    account_id: str,
+    suffix: str,
+    state: DeploymentState,
+    alb_base_url: str,
+    subnet_ids: list[str],
+    task_sg: str,
+    exec_arn: str,
+    task_arn: str,
+    vpc_id: str,
+) -> None:
+    """Add agent TG + listener rule + ECS service to an existing lab ALB."""
+    if _agent_deployed(state):
+        print("[deploy] Agent ECS service already in connection.env; skip incremental provision")
+        return
+    if not state.listener_arn:
+        raise RuntimeError("Incremental agent deploy requires LISTENER_ARN in connection.env")
+
+    spec = agent_service_spec(project_root)
+    tg_arn = create_target_group(elbv2, vpc_id, suffix, AGENT_SERVICE_ID)
+    _add_agent_listener_rule(
+        elbv2,
+        listener_arn=state.listener_arn,
+        target_group_arn=tg_arn,
+    )
+
+    repo_name = f"dijkfood-{spec['ecr_suffix']}-{suffix}"
+    ensure_ecr_repository(ecr, repo_name)
+    image_uri = build_and_push_image(
+        region=deploy_region,
+        account_id=account_id,
+        repo_name=repo_name,
+        docker_context=spec["docker_context"],  # type: ignore[arg-type]
+        dockerfile=spec["dockerfile"],  # type: ignore[arg-type]
+    )
+    log_grp = f"/ecs/dijkfood-{AGENT_SERVICE_ID}-{suffix}"
+    ensure_log_group(logs, log_grp)
+    env = build_agent_task_environment(
+        region=deploy_region,
+        alb_base_url=alb_base_url,
+        sessions_table=state.dynamo_agent_sessions_table or "",
+        project_root=project_root,
+    )
+    cluster = state.cluster_name or f"dijkfood-{suffix}"
+    svc_name = f"dijkfood-{AGENT_SERVICE_ID}-{suffix}"
+    create_ecs_service(
+        ecs,
+        cluster_name=cluster,
+        service_name=svc_name,
+        service_id=AGENT_SERVICE_ID,
+        task_family=f"dijkfood-{AGENT_SERVICE_ID}-{suffix}",
+        image_uri=image_uri,
+        execution_role_arn=exec_arn,
+        task_role_arn=task_arn,
+        log_group=log_grp,
+        region=deploy_region,
+        subnet_ids=subnet_ids,
+        task_sg_id=task_sg,
+        target_group_arn=tg_arn,
+        suffix=suffix,
+        state=state,
+        environment=env,
+        cpu=str(spec["cpu"]),
+        memory=str(spec["memory"]),
+        desired_count=int(spec["desired_count"]),
+        create_cluster_if_needed=False,
+    )
+    _configure_service_autoscaling_if_enabled(
+        app_autoscaling,
+        cluster_name=cluster,
+        service_name=svc_name,
+        spec=spec,
+    )
+    wait_for_service_stable(ecs, cluster, svc_name)
+    print(f"[deploy] Agent ready at {alb_base_url}/agent/v1/chat")
 
 
 def _configure_service_autoscaling_if_enabled(
@@ -326,7 +477,12 @@ def redeploy_single_service(
         print(f"[deploy] ERROR: {e}")
         raise SystemExit(1) from e
 
-    specs = _service_specs(project_root)
+    if service_id == AGENT_SERVICE_ID:
+        load_agent_dotenv(project_root)
+        restore_lab_credentials_for_deploy(project_root)
+        require_bedrock_credentials(project_root)
+
+    specs = _service_specs(project_root, with_agent=(service_id == AGENT_SERVICE_ID))
     try:
         spec = _spec_for_id(specs, service_id)
     except KeyError:
@@ -432,6 +588,16 @@ def redeploy_single_service(
         env = _ordering_environment_redeploy()
     elif service_id == "routing":
         env = _routing_environment_redeploy()
+    elif service_id == AGENT_SERVICE_ID:
+        if not state.dynamo_agent_sessions_table:
+            print("[deploy] ERROR: DYNAMO_AGENT_SESSIONS_TABLE missing; deploy with --with-agent first")
+            raise SystemExit(1)
+        env = build_agent_task_environment(
+            region=region,
+            alb_base_url=alb_base,
+            sessions_table=state.dynamo_agent_sessions_table or "",
+            project_root=project_root,
+        )
     else:
         env = _stub_environment_redeploy(service_id)
 
@@ -515,6 +681,10 @@ def run_teardown(
     except ClientError as e:
         print(f"[deploy] Teardown DynamoDB: {e}")
     try:
+        destroy_agent_sessions_table(ddb, state)
+    except ClientError as e:
+        print(f"[deploy] Teardown agent sessions DynamoDB: {e}")
+    try:
         destroy_rds(rds, ec2, state)
     except ClientError as e:
         print(f"[deploy] Teardown RDS: {e}")
@@ -563,6 +733,14 @@ def main() -> None:
             "from an existing ordering/tracking ECS task definition."
         ),
     )
+    parser.add_argument(
+        "--with-agent",
+        action="store_true",
+        help=(
+            "Deploy conversational agent on the lab ALB (4th ECS service). "
+            "Requires .env.agent with Bedrock API keys (BEDROCK_* injected on task; no Bedrock-account infra)."
+        ),
+    )
     args = parser.parse_args()
 
     project_root = _PROJECT_ROOT
@@ -575,10 +753,27 @@ def main() -> None:
         parser.error("cannot combine --service and --resume")
     if args.recreate and not args.service:
         parser.error("--recreate requires --service")
+    if args.with_agent and args.teardown_only:
+        parser.error("cannot combine --with-agent and --teardown-only")
+    if args.with_agent and args.service:
+        parser.error("cannot combine --with-agent and --service")
     if args.resume:
         args.skip_teardown = True
 
+    if args.with_agent:
+        load_agent_dotenv(project_root)
+        restore_lab_credentials_for_deploy(project_root)
+        try:
+            require_bedrock_credentials(project_root)
+        except RuntimeError as e:
+            print(f"[deploy] ERROR: {e}")
+            sys.exit(1)
+
     if args.service:
+        if args.service == AGENT_SERVICE_ID:
+            load_agent_dotenv(project_root)
+            restore_lab_credentials_for_deploy(project_root)
+            require_bedrock_credentials(project_root)
         redeploy_single_service(
             project_root, args.service, apply_service_spec=args.recreate
         )
@@ -684,6 +879,7 @@ def main() -> None:
             and state.dynamo_courier_positions_table
             and state.dynamo_routes_table
         )
+        skip_agent_dynamo = args.resume and bool(state.dynamo_agent_sessions_table)
         skip_s3 = args.resume and bool(state.routing_graph_s3_bucket)
         saved_ecs_records = list(state.ecs_services)
         ecs_rebuild_only = (
@@ -795,9 +991,23 @@ def main() -> None:
                 "[deploy] TASK_ROLE_ARN set: add s3:GetObject, s3:PutObject, s3:HeadObject "
                 f"on arn:aws:s3:::{b}/* to your lab task role for routing graph cache."
             )
-        time.sleep(10)
+        if args.with_agent:
+            _ensure_agent_dynamodb_and_iam(
+                ddb,
+                iam,
+                suffix,
+                state,
+                skip_create=skip_agent_dynamo,
+                using_external_task_role=using_external_task_role,
+            )
+            if using_external_task_role:
+                print(
+                    "[deploy] TASK_ROLE_ARN set: add DynamoDB on the agent sessions table "
+                    "and bedrock:Converse for your model to that role (Bedrock uses BEDROCK_* keys on the task)."
+                )
+            _snapshot_connection_env(state, region=deploy_region)
 
-        specs = _service_specs(project_root)
+        specs = _service_specs(project_root, with_agent=args.with_agent)
 
         def _ordering_env(alb_base_url: str) -> list[dict[str, str]]:
             return [
@@ -889,6 +1099,8 @@ def main() -> None:
                 svc_id = str(spec["id"])
                 rec = rec_by_id.get(svc_id)
                 if rec is None:
+                    if svc_id == AGENT_SERVICE_ID and args.with_agent:
+                        continue
                     raise RuntimeError(
                         f"--resume: missing service_id {svc_id!r} in ECS_SERVICES_JSON"
                     )
@@ -906,6 +1118,13 @@ def main() -> None:
                     env = _ordering_env(alb_base_url)
                 elif svc_id == "routing":
                     env = _routing_env()
+                elif svc_id == AGENT_SERVICE_ID:
+                    env = build_agent_task_environment(
+                        region=deploy_region,
+                        alb_base_url=alb_base_url,
+                        sessions_table=state.dynamo_agent_sessions_table or "",
+                        project_root=project_root,
+                    )
                 else:
                     env = _stub_env(svc_id)
                 create_ecs_service(
@@ -942,8 +1161,32 @@ def main() -> None:
                 wait_for_service_stable(ecs, cluster, rec.service_name)
                 _snapshot_connection_env(state, alb_base_url, region=deploy_region)
 
+            if args.with_agent and not _agent_deployed(state):
+                _provision_agent_on_existing_alb(
+                    project_root=project_root,
+                    ecs=ecs,
+                    elbv2=elbv2,
+                    ecr=ecr,
+                    logs=logs,
+                    app_autoscaling=app_autoscaling,
+                    deploy_region=deploy_region,
+                    account_id=account_id,
+                    suffix=suffix,
+                    state=state,
+                    alb_base_url=alb_base_url,
+                    subnet_ids=subnet_ids,
+                    task_sg=task_sg,
+                    exec_arn=exec_arn,
+                    task_arn=task_arn,
+                    vpc_id=vpc_id,
+                )
+                _snapshot_connection_env(state, alb_base_url, region=deploy_region)
+
+            agent_line = ""
+            if args.with_agent:
+                agent_line = f"\n  Agent: {alb_base_url}/agent/v1/chat"
             print(
-                f"[deploy] All ECS services stable. ALB: {alb_base_url}\n"
+                f"[deploy] All ECS services stable. ALB: {alb_base_url}{agent_line}\n"
                 "[deploy] Run load tests manually, e.g. "
                 f"python -m simulator.orchestration.load_sim --base-url {alb_base_url}"
             )
@@ -999,6 +1242,13 @@ def main() -> None:
                     env = _ordering_env(alb_base_url)
                 elif svc_id == "routing":
                     env = _routing_env()
+                elif svc_id == AGENT_SERVICE_ID:
+                    env = build_agent_task_environment(
+                        region=deploy_region,
+                        alb_base_url=alb_base_url,
+                        sessions_table=state.dynamo_agent_sessions_table or "",
+                        project_root=project_root,
+                    )
                 else:
                     env = _stub_env(svc_id)
                 svc_name = f"dijkfood-{svc_id}-{suffix}"
@@ -1039,8 +1289,11 @@ def main() -> None:
                     state, f"http://{alb_dns}", region=deploy_region
                 )
 
+            agent_line = ""
+            if args.with_agent:
+                agent_line = f"\n  Agent: http://{alb_dns}/agent/v1/chat"
             print(
-                f"[deploy] All ECS services stable. ALB: http://{alb_dns}\n"
+                f"[deploy] All ECS services stable. ALB: http://{alb_dns}{agent_line}\n"
                 "[deploy] Run load tests manually, e.g. "
                 f"python -m simulator.orchestration.load_sim --base-url http://{alb_dns}"
             )

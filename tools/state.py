@@ -37,10 +37,15 @@ class DeploymentState:
     dynamo_order_logs_table: str | None = None
     dynamo_courier_positions_table: str | None = None
     dynamo_routes_table: str | None = None
+    dynamo_agent_sessions_table: str | None = None
     dynamo_order_logs_arn: str | None = None
     dynamo_courier_positions_arn: str | None = None
     dynamo_routes_arn: str | None = None
+    dynamo_agent_sessions_arn: str | None = None
     routing_graph_s3_bucket: str | None = None
+    agent_ui_target_group_arn: str | None = None
+    agent_ui_listener_rule_arn: str | None = None
+    agent_ui_url: str | None = None
     created_sg_ids: list[str] = field(default_factory=list)
 
     def note_sg(self, sg_id: str) -> None:

@@ -315,3 +315,24 @@ Base path in ALB: `/routing`
   - success: `{ courier_id, distance_m, node_ids, coordinates, error: null }`
   - no reachable courier: `{ error: "no_reachable_courier" }`
 
+---
+
+## Agent Service (`agent/`)
+
+Base path: `/agent` (ALB rule `/agent*`)
+
+Conversational API backed by AWS Bedrock. Read-only tools call ordering, tracking, and routing HTTP endpoints. See [`agent/README.md`](../agent/README.md) for the tool registry.
+
+#### `GET /agent/health`
+- **Output:** `{ "status": "ok", "service": "agent" }`
+
+#### `GET /agent/v1/tools`
+- **Output:** `{ "tools": [ { name, service, status, enabled, endpoint_ref }, ... ] }`
+
+#### `POST /agent/v1/chat`
+- **Input JSON:** `{ "message": string, "conversation_id"?: string }`
+- **Output JSON:** `{ "conversation_id", "reply", "tools_used": [ ... ] }`
+
+#### `DELETE /agent/v1/conversations/{conversation_id}`
+- **Output:** `204 No Content`
+

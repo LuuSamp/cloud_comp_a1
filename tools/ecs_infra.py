@@ -288,9 +288,20 @@ def create_target_group(
     vpc_id: str,
     suffix: str,
     service_id: str,
+    *,
+    health_check_path: str | None = None,
 ) -> str:
     tg_name = f"dftg{suffix}-{service_id}"[:32]
-    health_path = "/routing/ready" if service_id == "routing" else "/health"
+    if health_check_path is not None:
+        health_path = health_check_path
+    elif service_id == "routing":
+        health_path = "/routing/ready"
+    elif service_id == "agent-ui":
+        health_path = "/health"
+    elif service_id == "agent":
+        health_path = "/agent/health"
+    else:
+        health_path = "/health"
     interval_s = 60 if service_id == "routing" else 30
     healthy_n = 2
     unhealthy_n = 10 if service_id == "routing" else 5

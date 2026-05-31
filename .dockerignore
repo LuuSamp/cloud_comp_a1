@@ -24,6 +24,8 @@ htmlcov
 # Secrets and deploy snapshots
 .env
 connection.env
+agent_connection.env
+.env.agent
 *.pem
 
 # Large graph / local OSM dumps (not in ordering or tracking images)
