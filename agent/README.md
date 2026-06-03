@@ -31,6 +31,9 @@ Tools are registered in `agent/tools/` on import. Enable subsets with `AGENT_ENA
 | `get_courier_position` | tracking | beta | `GET /tracking/get-courier-position` |
 | `get_customer` | ordering | beta | `GET /customers/{customer_id}` |
 | `get_food_place` | ordering | beta | `GET /food-places/{food_place_id}` |
+| `report_unrelated_question` | agent | stable | Last resort when no other tool can answer; fixed refusal message |
+
+`report_unrelated_question` stays enabled even when `AGENT_ENABLED_TOOLS` is set (unless listed in `AGENT_DISABLED_TOOLS`).
 
 ## Environment (lab ECS task)
 

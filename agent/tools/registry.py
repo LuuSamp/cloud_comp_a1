@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 ToolStatus = Literal["stable", "beta", "stub"]
-ToolService = Literal["ordering", "tracking", "routing"]
+ToolService = Literal["ordering", "tracking", "routing", "agent"]
 
 _REGISTRY: dict[str, ToolSpec] = {}
 
@@ -22,6 +22,7 @@ class ToolSpec:
     service: ToolService
     status: ToolStatus = "stable"
     endpoint_ref: str = ""
+    always_enabled: bool = False
 
 
 def register_tool(spec: ToolSpec) -> None:
@@ -42,10 +43,12 @@ def _parse_name_list(env_key: str) -> set[str] | None:
 
 
 def _is_tool_enabled(spec: ToolSpec) -> bool:
-    enabled = _parse_name_list("AGENT_ENABLED_TOOLS")
     disabled = _parse_name_list("AGENT_DISABLED_TOOLS") or set()
     if spec.name in disabled:
         return False
+    if spec.always_enabled:
+        return True
+    enabled = _parse_name_list("AGENT_ENABLED_TOOLS")
     if enabled is not None:
         return spec.name in enabled
     if spec.status == "stub":
