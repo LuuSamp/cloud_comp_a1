@@ -10,7 +10,7 @@ Natural-language Q&A about order state and history. The agent calls **read-only 
 |--------|------|-------------|
 | GET | `/agent/health` | Liveness |
 | GET | `/agent/v1/tools` | Enabled tools and metadata |
-| GET | `/agent/v1/usage` | Aggregated Bedrock token usage (DynamoDB counters) |
+| GET | `/agent/v1/usage` | Aggregated usage: tokens from CloudWatch (Bedrock account), chat/tool counts from DynamoDB |
 | POST | `/agent/v1/chat` | `{ "message": "...", "conversation_id"?: "uuid" }` → `{ "conversation_id", "reply", "tools_used", "usage" }` |
 | DELETE | `/agent/v1/conversations/{id}` | Delete session |
 
@@ -47,6 +47,11 @@ Tools are registered in `agent/tools/` on import. Enable subsets with `AGENT_ENA
 | `BEDROCK_AWS_*` | Bedrock credentials (not `AWS_ACCESS_KEY_ID` on task) |
 | `AGENT_MAX_TOOL_ROUNDS` | Default `5` |
 | `AGENT_USAGE_BUDGET_*` | Optional monitoring UI budgets |
+| `AGENT_USAGE_HISTORY_DAYS` | CloudWatch lookback for token totals (default `7`) |
+
+Token totals on `/v1/usage` come from **CloudWatch** (`AWS/Bedrock` metrics) using the same `BEDROCK_AWS_*` credentials as Converse. The Bedrock account IAM user needs `cloudwatch:GetMetricData`. Chat request and tool-call counters remain in DynamoDB and reset when the sessions table is torn down.
+
+Per-request token counts in `POST /v1/chat` still come from the Converse response (not CloudWatch).
 
 ## UI
 

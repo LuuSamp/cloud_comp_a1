@@ -11,7 +11,7 @@
       <header class="header">
         <div class="header-title">
           <h1>Usage monitoring</h1>
-          <p class="subtitle">Bedrock tokens and request volume (shared across all users)</p>
+          <p class="subtitle">Bedrock tokens (CloudWatch) and chat volume (DynamoDB)</p>
         </div>
         <nav class="nav-tabs" aria-label="Agent UI">
           <a href="index.html" class="nav-tab">Chat</a>
@@ -51,7 +51,7 @@
             <thead>
               <tr>
                 <th>Date</th>
-                <th>Requests</th>
+                <th>Chat reqs</th>
                 <th>Tokens</th>
                 <th>In / Out</th>
                 <th>Bedrock calls</th>
@@ -62,15 +62,19 @@
           </table>
         </div>
         <p class="hint hidden" id="daily-empty">
-          No usage recorded yet. Send a chat message to start accumulating metrics.
+          No CloudWatch token data yet for this model. Send a chat message and wait a few minutes
+          for metrics to appear.
         </p>
       </section>
 
       <p class="hint monitor-footer">
-        Counters persist in DynamoDB on the agent service. Set
+        Token totals come from CloudWatch in the Bedrock account (last
+        <span id="history-days">7</span> days). Chat requests and tool calls are counted in
+        DynamoDB on the lab agent and reset if the sessions table is torn down. Set
         <code>AGENT_USAGE_BUDGET_TOKENS</code> and
         <code>AGENT_USAGE_DAILY_BUDGET_TOKENS</code> in <code>.env.agent</code> to show
-        progress bars. Redeploy the agent after changing budgets.
+        progress bars. The Bedrock IAM user needs <code>cloudwatch:GetMetricData</code>.
+        Redeploy the agent after changing budgets.
       </p>
     </div>
 

@@ -48,7 +48,7 @@ Point the UI at `http://localhost:8003` (or your lab `BASE_URL`).
 ## Features
 
 - Multi-turn chat (`conversation_id` in DynamoDB on the lab account)
-- **Monitoring** page at `/ui/monitor.html` — token totals, daily breakdown, optional budgets
+- **Monitoring** page at `/ui/monitor.html` — CloudWatch token totals (Bedrock account), DynamoDB chat/tool counters, optional budgets
 - **New chat** clears the server session
 - **Tools used** expander on replies; per-reply token counts when the API returns `usage`
 - Health check against `/agent/health`
@@ -60,6 +60,9 @@ In `.env.agent` set optional limits (shown as progress bars on the monitoring pa
 ```bash
 AGENT_USAGE_BUDGET_TOKENS=500000
 AGENT_USAGE_DAILY_BUDGET_TOKENS=50000
+# AGENT_USAGE_HISTORY_DAYS=7
 ```
+
+Token totals on the monitoring page come from CloudWatch in the Bedrock account (survives lab teardown). Chat request and tool-call counts come from DynamoDB (reset when the sessions table is recreated). The Bedrock IAM user needs `cloudwatch:GetMetricData`.
 
 Redeploy the agent after changing these (`python deploy.py --service agent`).

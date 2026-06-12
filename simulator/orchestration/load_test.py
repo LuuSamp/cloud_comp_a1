@@ -109,7 +109,37 @@ def main() -> None:
         action="store_true",
         help="On HTTP errors, print response body (truncated) to stderr",
     )
+    p.add_argument(
+        "--spike-region",
+        type=int,
+        default=0,
+        metavar="FOOD_PLACE_ID",
+        help="Concentrate orders on one restaurant (sets SIM_SPIKE_FOOD_PLACE_ID)",
+    )
+    p.add_argument(
+        "--spike-probability",
+        type=float,
+        default=0.7,
+        help="Probability of choosing --spike-region restaurant when set",
+    )
+    p.add_argument(
+        "--courier-shortage",
+        action="store_true",
+        help="Slow courier position updates to simulate reduced availability",
+    )
+    p.add_argument(
+        "--courier-shortage-factor",
+        type=float,
+        default=4.0,
+        help="Multiplier on position interval when --courier-shortage is set",
+    )
     args = p.parse_args()
+    if args.spike_region > 0:
+        os.environ["SIM_SPIKE_FOOD_PLACE_ID"] = str(args.spike_region)
+        os.environ["SIM_SPIKE_PROBABILITY"] = str(args.spike_probability)
+    if args.courier_shortage:
+        os.environ["SIM_COURIER_SHORTAGE"] = "1"
+        os.environ["SIM_COURIER_SHORTAGE_FACTOR"] = str(args.courier_shortage_factor)
     if not args.base_url:
         p.error("Pass --base-url or set BASE_URL in repo-root .env / connection.env")
     if args.orders_per_second <= 0:

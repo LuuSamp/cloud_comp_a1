@@ -38,6 +38,13 @@ K_DDB_POS = "DYNAMO_COURIER_POSITIONS_TABLE"
 K_DDB_ROUTES = "DYNAMO_ROUTES_TABLE"
 K_DDB_AGENT_SESSIONS = "DYNAMO_AGENT_SESSIONS_TABLE"
 K_ROUTING_GRAPH_S3 = "ROUTING_GRAPH_S3_BUCKET"
+K_DATALAKE_S3 = "DATALAKE_S3_BUCKET"
+K_GLUE_DATABASE = "GLUE_DATABASE"
+K_GLUE_CRAWLER = "GLUE_CRAWLER_NAME"
+K_DDB_PREDICTIONS = "DYNAMO_PREDICTIONS_TABLE"
+K_SAGEMAKER_DELIVERY_ENDPOINT = "SAGEMAKER_DELIVERY_ENDPOINT"
+K_SAGEMAKER_DEMAND_MODEL = "SAGEMAKER_DEMAND_MODEL_NAME"
+K_SAGEMAKER_ANOMALY_MODEL = "SAGEMAKER_ANOMALY_MODEL_NAME"
 K_AGENT_UI_TG_ARN = "AGENT_UI_TARGET_GROUP_ARN"
 K_AGENT_UI_RULE_ARN = "AGENT_UI_LISTENER_RULE_ARN"
 K_AGENT_UI_URL = "AGENT_UI_URL"
@@ -75,6 +82,13 @@ def write_connection_env(
         (K_DDB_ROUTES, state.dynamo_routes_table),
         (K_DDB_AGENT_SESSIONS, state.dynamo_agent_sessions_table),
         (K_ROUTING_GRAPH_S3, state.routing_graph_s3_bucket),
+        (K_DATALAKE_S3, state.datalake_s3_bucket),
+        (K_GLUE_DATABASE, state.glue_database),
+        (K_GLUE_CRAWLER, state.glue_crawler_name),
+        (K_DDB_PREDICTIONS, state.dynamo_predictions_table),
+        (K_SAGEMAKER_DELIVERY_ENDPOINT, state.sagemaker_delivery_endpoint),
+        (K_SAGEMAKER_DEMAND_MODEL, state.sagemaker_demand_model_name),
+        (K_SAGEMAKER_ANOMALY_MODEL, state.sagemaker_anomaly_model_name),
         (K_AGENT_UI_TG_ARN, state.agent_ui_target_group_arn),
         (K_AGENT_UI_RULE_ARN, state.agent_ui_listener_rule_arn),
         (K_AGENT_UI_URL, state.agent_ui_url),
@@ -148,6 +162,19 @@ def load_connection_env(
         os.getenv(K_DDB_AGENT_SESSIONS) or ""
     ).strip() or None
     state.routing_graph_s3_bucket = (os.getenv(K_ROUTING_GRAPH_S3) or "").strip() or None
+    state.datalake_s3_bucket = (os.getenv(K_DATALAKE_S3) or "").strip() or None
+    state.glue_database = (os.getenv(K_GLUE_DATABASE) or "").strip() or None
+    state.glue_crawler_name = (os.getenv(K_GLUE_CRAWLER) or "").strip() or None
+    state.dynamo_predictions_table = (os.getenv(K_DDB_PREDICTIONS) or "").strip() or None
+    state.sagemaker_delivery_endpoint = (
+        os.getenv(K_SAGEMAKER_DELIVERY_ENDPOINT) or ""
+    ).strip() or None
+    state.sagemaker_demand_model_name = (
+        os.getenv(K_SAGEMAKER_DEMAND_MODEL) or ""
+    ).strip() or None
+    state.sagemaker_anomaly_model_name = (
+        os.getenv(K_SAGEMAKER_ANOMALY_MODEL) or ""
+    ).strip() or None
     state.agent_ui_target_group_arn = (
         os.getenv(K_AGENT_UI_TG_ARN) or ""
     ).strip() or None

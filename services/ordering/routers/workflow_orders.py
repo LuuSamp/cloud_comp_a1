@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 import os
 import threading
 import time
+import urllib.error
+import urllib.request
 from decimal import Decimal
 from typing import Annotated, Any
 
@@ -35,6 +38,7 @@ class PlaceOrderOut(BaseModel):
     ok: bool
     message: str
     order_id: int
+    predicted_delivery_seconds: float | None = None
 
 
 class AssignCourierIn(BaseModel):
@@ -118,6 +122,52 @@ def _latest_position_by_courier(courier_id: int) -> tuple[float, float] | None:
         last_key = resp.get("LastEvaluatedKey")
         if not last_key:
             return None
+
+
+def _dispatch_delivery_prediction(
+    *,
+    order_id: int,
+    food_place_id: int,
+    customer_id: int,
+) -> None:
+    base = (os.environ.get("PREDICTION_BASE_URL") or "").strip().rstrip("/")
+    if not base:
+        return
+    timeout_s = float(os.environ.get("PLACE_ORDER_PREDICTION_TIMEOUT_S", "0.3"))
+    now = dt.datetime.now(dt.timezone.utc)
+
+    def _job() -> None:
+        payload = {
+            "order_id": order_id,
+            "food_place_id": food_place_id,
+            "customer_id": customer_id,
+            "hour": now.hour,
+            "weekday": now.weekday(),
+        }
+        url = f"{base}/prediction/v1/delivery-time"
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            log.info(
+                "delivery prediction order_id=%s seconds=%s source=%s",
+                order_id,
+                body.get("predicted_seconds"),
+                body.get("source"),
+            )
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            log.debug("delivery prediction skipped order_id=%s: %s", order_id, exc)
+
+    threading.Thread(
+        target=_job,
+        name=f"prediction-job-{order_id}",
+        daemon=True,
+    ).start()
 
 
 def _dispatch_route_calculation(
@@ -285,6 +335,11 @@ def place_order(
         origin_lng=float(food_place["lon"]),
         destination_lat=float(customer["lat"]),
         destination_lng=float(customer["lon"]),
+    )
+    _dispatch_delivery_prediction(
+        order_id=order_id,
+        food_place_id=body.food_place_id,
+        customer_id=body.customer_id,
     )
 
     log_table = get_order_logs_table()

@@ -1,0 +1,21 @@
+# DijkFood — local dev: deploy, ML/SageMaker pipeline, dashboard, simulators
+#
+#   pip install -r requirements.txt
+#
+# Deploy only:
+#   pip install -r requirements-deploy.txt
+#
+# ML / SageMaker only (Python 3.14 OK for train + batch via AWS; use 3.11–3.12 for --local):
+#   pip install -r requirements-ml.txt
+
+-r requirements-ml.txt
+
+# Analytics dashboard (Streamlit + Athena)
+streamlit>=1.28.0
+pyathena>=3.0.0
+
+# Load simulators
+-r simulator/requirements.txt
+
+# ML unit tests (ml/test_features.py; needs sklearn — Python <3.13)
+pytest>=7.0.0; python_version < "3.13"

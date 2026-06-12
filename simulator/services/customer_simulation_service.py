@@ -77,7 +77,15 @@ def run(args: argparse.Namespace) -> int:
             continue
 
         c = rng.choice(customers)
-        f = rng.choice(foods)
+        spike_id = (os.environ.get("SIM_SPIKE_FOOD_PLACE_ID") or "").strip()
+        if spike_id.isdigit():
+            spike_fp = [x for x in foods if int(x.get("food_place_id", -1)) == int(spike_id)]
+            if spike_fp and rng.random() < float(os.environ.get("SIM_SPIKE_PROBABILITY", "0.7")):
+                f = spike_fp[0]
+            else:
+                f = rng.choice(foods)
+        else:
+            f = rng.choice(foods)
         try:
             cid = int(c["customer_id"])
             fid = int(f["food_place_id"])

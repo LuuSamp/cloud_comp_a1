@@ -249,14 +249,22 @@ def deploy_dashboard(*, desired_count: int = 1, teardown: bool = False) -> None:
     )
     ensure_log_group(logs, log_group)
 
+    glue_db = (
+        state.glue_database
+        or os.environ.get("GLUE_DATABASE")
+        or os.environ.get("ATHENA_DB")
+        or ""
+    )
+    datalake_bucket = state.datalake_s3_bucket or os.environ.get("DATALAKE_S3_BUCKET", "")
     env = [
         {"name": "AWS_REGION", "value": region},
         {"name": "AWS_DEFAULT_REGION", "value": region},
         {"name": "SERVICE_ID", "value": SERVICE_ID},
-        {"name": "DATALAKE_S3_BUCKET", "value": os.environ.get("DATALAKE_S3_BUCKET", "")},
+        {"name": "DATALAKE_S3_BUCKET", "value": datalake_bucket},
         {"name": "DATALAKE_EVENTS_PREFIX", "value": os.environ.get("DATALAKE_EVENTS_PREFIX", "events/")},
         {"name": "ROUTING_GRAPH_S3_BUCKET", "value": state.routing_graph_s3_bucket or ""},
-        {"name": "ATHENA_DB", "value": os.environ.get("ATHENA_DB", "")},
+        {"name": "GLUE_DATABASE", "value": glue_db},
+        {"name": "ATHENA_DB", "value": glue_db},
     ]
 
     if ecs_service_exists(ecs, state.cluster_name, service_name):

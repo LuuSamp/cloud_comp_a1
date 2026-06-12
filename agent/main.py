@@ -82,6 +82,7 @@ class UsageSummaryResponse(BaseModel):
     budget: UsageBudget
     updated_at: str | None = None
     model_id: str | None = None
+    usage_history_days: int = 7
     max_tool_rounds: int = 5
     max_output_tokens: int = 2048
 

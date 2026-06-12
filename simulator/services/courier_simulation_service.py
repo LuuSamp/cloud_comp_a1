@@ -175,6 +175,8 @@ def run(args: argparse.Namespace) -> int:
     next_log = start + max(float(args.log_interval_s), 1.0)
     discover_interval = max(args.discovery_interval_ms, 1.0) / 1000.0
     emit_interval = max(args.position_interval_ms, 1.0) / 1000.0
+    if (os.environ.get("SIM_COURIER_SHORTAGE") or "").strip().lower() in ("1", "true", "yes"):
+        emit_interval *= float(os.environ.get("SIM_COURIER_SHORTAGE_FACTOR", "4"))
     courier_ids: list[int] = []
     assignments: dict[int, tuple[int, int, int]] = {}
     route_state: dict[int, CourierRouteState] = {}

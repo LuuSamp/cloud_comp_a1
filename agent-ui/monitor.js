@@ -69,25 +69,32 @@ function statCard(title, value, detail = "") {
 function renderSummary(data) {
   const t = data.totals || {};
   const b = data.budget || {};
+  const historyDays = data.usage_history_days || 7;
+  const historyDaysEl = document.getElementById("history-days");
+  if (historyDaysEl) historyDaysEl.textContent = String(historyDays);
 
   monitorMeta.innerHTML = `
     <span>Model: <strong>${data.model_id || "—"}</strong></span>
     <span>Max output tokens / request: <strong>${formatInt(data.max_output_tokens)}</strong></span>
     <span>Max tool rounds / request: <strong>${formatInt(data.max_tool_rounds)}</strong></span>
-    <span>Last activity: <strong>${data.updated_at || "—"}</strong></span>
+    <span>Metrics refreshed: <strong>${data.updated_at || "—"}</strong></span>
   `;
 
   statsGrid.innerHTML = [
-    statCard("Total tokens", formatInt(t.total_tokens), "All time (Bedrock)"),
+    statCard(
+      "Tokens (CloudWatch)",
+      formatInt(t.total_tokens),
+      `Last ${historyDays} days, Bedrock account`
+    ),
     statCard(
       "Input / output",
       `${formatInt(t.input_tokens)} / ${formatInt(t.output_tokens)}`,
       "Prompt vs completion"
     ),
-    statCard("Chat requests", formatInt(t.request_count)),
-    statCard("Bedrock API calls", formatInt(t.bedrock_rounds), "Converse rounds (incl. tools)"),
-    statCard("Tool invocations", formatInt(t.tool_calls)),
-    statCard("Today (UTC)", formatInt(b.today_tokens), "Tokens used today"),
+    statCard("Chat requests", formatInt(t.request_count), "DynamoDB (lab session)"),
+    statCard("Bedrock API calls", formatInt(t.bedrock_rounds), "CloudWatch Invocations"),
+    statCard("Tool invocations", formatInt(t.tool_calls), "DynamoDB (lab session)"),
+    statCard("Today (UTC)", formatInt(b.today_tokens), "Tokens from CloudWatch"),
   ].join("");
 
   const hasBudget =

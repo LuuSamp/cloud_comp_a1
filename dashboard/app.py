@@ -11,6 +11,8 @@ from botocore.exceptions import ClientError
 from pyathena import connect
 from dotenv import load_dotenv
 
+from ml.batch_output import parse_batch_transform_body, parse_jsonl_body
+
 
 st.set_page_config(page_title="DijkFood Analytics", layout="wide")
 st.title("🍔 DijkFood - Dashboard Analítico")
@@ -23,7 +25,8 @@ if (ROOT / "connection.env").is_file():
 
 
 # --- Data loading -------------------------------------------------
-ATHENA_DB = os.environ.get("ATHENA_DB")
+ATHENA_DB = os.environ.get("ATHENA_DB") or os.environ.get("GLUE_DATABASE")
+AWS_REGION = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
 S3_BUCKET_CANDIDATES = [
     (os.environ.get("DATALAKE_S3_BUCKET") or "").strip(),
     (os.environ.get("ROUTING_GRAPH_S3_BUCKET") or "").strip(),
@@ -31,10 +34,32 @@ S3_BUCKET_CANDIDATES = [
 S3_PREFIX = (os.environ.get("DATALAKE_EVENTS_PREFIX") or "events/").strip().lstrip("/")
 
 
-def query_athena(query: str) -> pd.DataFrame:
+def _athena_staging_dir() -> str:
+    bucket = next((b for b in S3_BUCKET_CANDIDATES if b), "")
+    if bucket:
+        return f"s3://{bucket}/athena-results/"
     sts = boto3.client("sts")
     account_id = sts.get_caller_identity()["Account"]
-    conn = connect(s3_staging_dir=f"s3://dijkfood-datalake-{account_id}-us-east-1/athena-results/", region_name="us-east-1")
+    return f"s3://dijkfood-datalake-{account_id}-{AWS_REGION}/athena-results/"
+
+
+def _resolve_events_table(db_name: str) -> str:
+    glue = boto3.client("glue", region_name=AWS_REGION)
+    try:
+        glue.get_table(DatabaseName=db_name, Name="events")
+        return "events"
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") != "EntityNotFoundException":
+            raise
+    for table in glue.get_tables(DatabaseName=db_name).get("TableList", []):
+        location = (table.get("StorageDescriptor") or {}).get("Location") or ""
+        if location.rstrip("/").endswith("/events"):
+            return table["Name"]
+    return "events"
+
+
+def query_athena(query: str) -> pd.DataFrame:
+    conn = connect(s3_staging_dir=_athena_staging_dir(), region_name=AWS_REGION)
     return pd.read_sql(query, conn)
 
 
@@ -96,10 +121,19 @@ def load_events() -> pd.DataFrame:
     # Prefer Athena if ATHENA_DB is configured; otherwise read the S3 datalake.
     if ATHENA_DB:
         try:
-            df = query_athena(f"SELECT * FROM {ATHENA_DB}.events")
-            return _normalize_events(df.to_dict(orient="records"))
+            table = _resolve_events_table(ATHENA_DB)
+            df = query_athena(f"SELECT * FROM {ATHENA_DB}.{table}")
+            normalized = _normalize_events(df.to_dict(orient="records"))
+            if not normalized.empty:
+                return normalized
         except Exception as e:
-            st.error(f"Falha ao consultar Athena: {e}")
+            err = str(e)
+            if "TABLE_NOT_FOUND" in err or "EntityNotFoundException" in err:
+                st.warning(
+                    "Tabela Glue `events` ainda não disponível no Athena; lendo eventos diretamente do S3."
+                )
+            else:
+                st.error(f"Falha ao consultar Athena: {e}")
     candidates = [b for b in dict.fromkeys(S3_BUCKET_CANDIDATES) if b]
     if not candidates:
         st.warning(
@@ -244,3 +278,57 @@ if not hist.empty:
     st.bar_chart(hist_bins)
 else:
     st.write("Sem entregas completas (status 6) nos dados coletados.")
+
+
+def _load_s3_prediction_jsonl(bucket: str, prefix: str) -> list[dict[str, Any]]:
+    if not bucket:
+        return []
+    s3 = boto3.client("s3")
+    latest_key = f"{prefix.rstrip('/')}/latest.jsonl"
+    try:
+        body = s3.get_object(Bucket=bucket, Key=latest_key)["Body"].read().decode("utf-8")
+        rows = parse_jsonl_body(body)
+        if rows:
+            return rows
+    except ClientError:
+        pass
+    keys: list[str] = []
+    try:
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                k = obj.get("Key", "")
+                if k.endswith(".out"):
+                    keys.append(k)
+    except ClientError:
+        return []
+    if not keys:
+        return []
+    body = s3.get_object(Bucket=bucket, Key=sorted(keys)[-1])["Body"].read().decode("utf-8")
+    return parse_batch_transform_body(body)
+
+
+st.header("Camada Preditiva (SageMaker)")
+datalake = next((b for b in dict.fromkeys(S3_BUCKET_CANDIDATES) if b), "")
+demand_rows = _load_s3_prediction_jsonl(datalake, "ml/predictions/demand/")
+anomaly_rows = _load_s3_prediction_jsonl(datalake, "ml/predictions/anomaly/")
+
+col3, col4 = st.columns(2)
+with col3:
+    st.subheader("Previsão de demanda (batch)")
+    if demand_rows:
+        st.dataframe(pd.DataFrame(demand_rows).head(20))
+    else:
+        st.write("Execute `python -m ml.batch_predict` após o treinamento.")
+with col4:
+    st.subheader("Anomalias operacionais (batch)")
+    if anomaly_rows:
+        st.dataframe(pd.DataFrame(anomaly_rows).head(20))
+    else:
+        st.write("Sem saídas de anomalia em s3://…/ml/predictions/anomaly/.")
+
+if ATHENA_DB or os.environ.get("GLUE_DATABASE"):
+    st.caption(
+        f"Athena/Glue: {ATHENA_DB or os.environ.get('GLUE_DATABASE')} — "
+        "consultas históricas também disponíveis via agente (`query_analytics`)."
+    )

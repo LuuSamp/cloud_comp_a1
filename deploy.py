@@ -21,7 +21,10 @@ Usage:
   python deploy.py --service tracking --recreate   # also set desired_count from _service_specs (UpdateService only)
   python deploy.py --resume   # reuse RDS/Dynamo/S3 from connection.env; rebuild ECS (implies --skip-teardown)
   python deploy.py --skip-teardown --with-agent   # lab stack + agent on same ALB (.env.agent Bedrock keys)
+  python deploy.py --skip-teardown --with-analytics   # datalake + Glue + Streams ingest
+  python deploy.py --skip-teardown --with-predictions # analytics + prediction ECS gateway
   python deploy.py --service agent   # redeploy agent only (requires prior --with-agent deploy)
+  python deploy.py --service prediction   # redeploy prediction service only
 
   Single-service redeploy uses connection.env (run a full deploy with --skip-teardown first).
   Ordering/tracking redeploy: DIJKFOOD_DB_PASSWORD is optional if the service already runs with
@@ -100,6 +103,23 @@ from tools.agent_infra import (
     attach_agent_sessions_policy,
     create_agent_sessions_table,
     destroy_agent_sessions_table,
+)
+from tools.analytics_infra import (
+    create_predictions_table,
+    destroy_analytics_lambda,
+    destroy_predictions_table,
+    enable_analytics_ingestion,
+)
+from tools.datalake_infra import create_datalake_bucket, destroy_datalake_bucket
+from tools.glue_infra import create_glue_catalog, destroy_glue_catalog, run_glue_crawler
+from tools.prediction_deploy import (
+    PREDICTION_SERVICE_ID,
+    build_prediction_task_environment,
+    prediction_service_spec,
+)
+from tools.sagemaker_infra import (
+    DEFAULT_DELIVERY_ENDPOINT,
+    destroy_sagemaker_endpoints,
 )
 from tools.rds_infra import (
     allow_rds_from_ecs_tasks,
@@ -193,13 +213,21 @@ def _hydrate_dynamo_arns(ddb, state: DeploymentState) -> None:
     if state.dynamo_agent_sessions_table:
         t = ddb.describe_table(TableName=state.dynamo_agent_sessions_table)["Table"]
         state.dynamo_agent_sessions_arn = t["TableArn"]
+    if state.dynamo_predictions_table:
+        t = ddb.describe_table(TableName=state.dynamo_predictions_table)["Table"]
+        state.dynamo_predictions_arn = t["TableArn"]
 
 
 BASE_SERVICE_IDS = ("ordering", "tracking", "routing")
-SERVICE_IDS = BASE_SERVICE_IDS + (AGENT_SERVICE_ID,)
+SERVICE_IDS = BASE_SERVICE_IDS + (AGENT_SERVICE_ID, PREDICTION_SERVICE_ID)
 
 
-def _service_specs(project_root: Path, *, with_agent: bool = False) -> list[dict[str, object]]:
+def _service_specs(
+    project_root: Path,
+    *,
+    with_agent: bool = False,
+    with_predictions: bool = False,
+) -> list[dict[str, object]]:
     specs: list[dict[str, object]] = [
         {
             "id": "ordering",
@@ -265,11 +293,32 @@ def _service_specs(project_root: Path, *, with_agent: bool = False) -> list[dict
     ]
     if with_agent:
         specs.append(agent_service_spec(project_root))
+    if with_predictions:
+        specs.append(prediction_service_spec(project_root))
     return specs
 
 
 def _agent_deployed(state: DeploymentState) -> bool:
     return any(r.service_id == AGENT_SERVICE_ID for r in state.ecs_services)
+
+
+def _prediction_deployed(state: DeploymentState) -> bool:
+    return any(r.service_id == PREDICTION_SERVICE_ID for r in state.ecs_services)
+
+
+def _enrich_agent_env(env: list[dict[str, str]], state: DeploymentState, alb_base: str) -> list[dict[str, str]]:
+    extra: list[dict[str, str]] = []
+    if state.datalake_s3_bucket:
+        extra.append({"name": "DATALAKE_S3_BUCKET", "value": state.datalake_s3_bucket})
+    if state.glue_database:
+        extra.append({"name": "GLUE_DATABASE", "value": state.glue_database})
+    if _prediction_deployed(state) or state.dynamo_predictions_table:
+        extra.append({"name": "PREDICTION_BASE_URL", "value": alb_base.rstrip("/")})
+    names = {e["name"] for e in env}
+    for item in extra:
+        if item["name"] not in names:
+            env.append(item)
+    return env
 
 
 def _ensure_agent_dynamodb_and_iam(
@@ -358,11 +407,15 @@ def _provision_agent_on_existing_alb(
     )
     log_grp = f"/ecs/dijkfood-{AGENT_SERVICE_ID}-{suffix}"
     ensure_log_group(logs, log_grp)
-    env = build_agent_task_environment(
-        region=deploy_region,
-        alb_base_url=alb_base_url,
-        sessions_table=state.dynamo_agent_sessions_table or "",
-        project_root=project_root,
+    env = _enrich_agent_env(
+        build_agent_task_environment(
+            region=deploy_region,
+            alb_base_url=alb_base_url,
+            sessions_table=state.dynamo_agent_sessions_table or "",
+            project_root=project_root,
+        ),
+        state,
+        alb_base_url,
     )
     cluster = state.cluster_name or f"dijkfood-{suffix}"
     svc_name = f"dijkfood-{AGENT_SERVICE_ID}-{suffix}"
@@ -396,6 +449,92 @@ def _provision_agent_on_existing_alb(
     )
     wait_for_service_stable(ecs, cluster, svc_name)
     print(f"[deploy] Agent ready at {alb_base_url}/agent/v1/chat")
+
+
+def _provision_prediction_on_existing_alb(
+    *,
+    project_root: Path,
+    ecs,
+    elbv2,
+    ecr,
+    logs,
+    app_autoscaling,
+    deploy_region: str,
+    account_id: str,
+    suffix: str,
+    state: DeploymentState,
+    alb_base_url: str,
+    subnet_ids: list[str],
+    task_sg: str,
+    exec_arn: str,
+    task_arn: str,
+    vpc_id: str,
+) -> None:
+    if _prediction_deployed(state):
+        print("[deploy] Prediction ECS service already in connection.env; skip incremental provision")
+        return
+    if not state.listener_arn:
+        raise RuntimeError("Incremental prediction deploy requires LISTENER_ARN in connection.env")
+    if not state.datalake_s3_bucket or not state.dynamo_predictions_table:
+        raise RuntimeError("Incremental prediction deploy requires datalake and predictions table")
+
+    spec = prediction_service_spec(project_root)
+    tg_arn = create_target_group(elbv2, vpc_id, suffix, PREDICTION_SERVICE_ID)
+    elbv2.create_rule(
+        ListenerArn=state.listener_arn,
+        Priority=15,
+        Conditions=[{"Field": "path-pattern", "Values": ["/prediction*"]}],
+        Actions=[{"Type": "forward", "TargetGroupArn": tg_arn}],
+    )
+    repo_name = f"dijkfood-{spec['ecr_suffix']}-{suffix}"
+    ensure_ecr_repository(ecr, repo_name)
+    image_uri = build_and_push_image(
+        region=deploy_region,
+        account_id=account_id,
+        repo_name=repo_name,
+        docker_context=spec["docker_context"],  # type: ignore[arg-type]
+        dockerfile=spec["dockerfile"],  # type: ignore[arg-type]
+    )
+    log_grp = f"/ecs/dijkfood-{PREDICTION_SERVICE_ID}-{suffix}"
+    ensure_log_group(logs, log_grp)
+    env = build_prediction_task_environment(
+        region=deploy_region,
+        datalake_bucket=state.datalake_s3_bucket,
+        predictions_table=state.dynamo_predictions_table,
+        delivery_endpoint=state.sagemaker_delivery_endpoint,
+    )
+    cluster = state.cluster_name or f"dijkfood-{suffix}"
+    svc_name = f"dijkfood-{PREDICTION_SERVICE_ID}-{suffix}"
+    create_ecs_service(
+        ecs,
+        cluster_name=cluster,
+        service_name=svc_name,
+        service_id=PREDICTION_SERVICE_ID,
+        task_family=f"dijkfood-{PREDICTION_SERVICE_ID}-{suffix}",
+        image_uri=image_uri,
+        execution_role_arn=exec_arn,
+        task_role_arn=task_arn,
+        log_group=log_grp,
+        region=deploy_region,
+        subnet_ids=subnet_ids,
+        task_sg_id=task_sg,
+        target_group_arn=tg_arn,
+        suffix=suffix,
+        state=state,
+        environment=env,
+        cpu=str(spec["cpu"]),
+        memory=str(spec["memory"]),
+        desired_count=int(spec["desired_count"]),
+        create_cluster_if_needed=False,
+    )
+    _configure_service_autoscaling_if_enabled(
+        app_autoscaling,
+        cluster_name=cluster,
+        service_name=svc_name,
+        spec=spec,
+    )
+    wait_for_service_stable(ecs, cluster, svc_name)
+    print(f"[deploy] Prediction ready at {alb_base_url}/prediction/v1/delivery-time")
 
 
 def _configure_service_autoscaling_if_enabled(
@@ -482,7 +621,11 @@ def redeploy_single_service(
         restore_lab_credentials_for_deploy(project_root)
         require_bedrock_credentials(project_root)
 
-    specs = _service_specs(project_root, with_agent=(service_id == AGENT_SERVICE_ID))
+    specs = _service_specs(
+        project_root,
+        with_agent=(service_id == AGENT_SERVICE_ID),
+        with_predictions=(service_id == PREDICTION_SERVICE_ID),
+    )
     try:
         spec = _spec_for_id(specs, service_id)
     except KeyError:
@@ -529,7 +672,7 @@ def redeploy_single_service(
                 "or ensure this service's current ECS task has DB_PASSWORD (from a prior deploy)."
             )
             raise SystemExit(1)
-        return [
+        env = [
             {"name": "DB_HOST", "value": db_host},
             {"name": "DB_PORT", "value": "5432"},
             {"name": "DB_NAME", "value": DB_NAME},
@@ -551,6 +694,15 @@ def redeploy_single_service(
                 "value": state.dynamo_routes_table or "",
             },
         ]
+        if state.dynamo_predictions_table:
+            env.append(
+                {
+                    "name": "DYNAMODB_PREDICTIONS_TABLE",
+                    "value": state.dynamo_predictions_table,
+                }
+            )
+            env.append({"name": "PREDICTION_BASE_URL", "value": alb_base})
+        return env
 
     def _routing_environment_redeploy() -> list[dict[str, str]]:
         env = [
@@ -592,11 +744,25 @@ def redeploy_single_service(
         if not state.dynamo_agent_sessions_table:
             print("[deploy] ERROR: DYNAMO_AGENT_SESSIONS_TABLE missing; deploy with --with-agent first")
             raise SystemExit(1)
-        env = build_agent_task_environment(
+        env = _enrich_agent_env(
+            build_agent_task_environment(
+                region=region,
+                alb_base_url=alb_base,
+                sessions_table=state.dynamo_agent_sessions_table or "",
+                project_root=project_root,
+            ),
+            state,
+            alb_base,
+        )
+    elif service_id == PREDICTION_SERVICE_ID:
+        if not state.datalake_s3_bucket or not state.dynamo_predictions_table:
+            print("[deploy] ERROR: datalake/predictions missing; deploy with --with-predictions first")
+            raise SystemExit(1)
+        env = build_prediction_task_environment(
             region=region,
-            alb_base_url=alb_base,
-            sessions_table=state.dynamo_agent_sessions_table or "",
-            project_root=project_root,
+            datalake_bucket=state.datalake_s3_bucket,
+            predictions_table=state.dynamo_predictions_table,
+            delivery_endpoint=state.sagemaker_delivery_endpoint,
         )
     else:
         env = _stub_environment_redeploy(service_id)
@@ -664,8 +830,25 @@ def run_teardown(
     ddb,
     s3,
     state: DeploymentState,
+    region: str = REGION,
 ) -> None:
     print("[deploy] --- Teardown ---")
+    session = boto3.Session(region_name=region)
+    sm = session.client("sagemaker")
+    glue = session.client("glue")
+    lambda_client = session.client("lambda")
+    try:
+        destroy_sagemaker_endpoints(sm, state)
+    except ClientError as e:
+        print(f"[deploy] Teardown SageMaker: {e}")
+    try:
+        destroy_analytics_lambda(lambda_client, state)
+    except ClientError as e:
+        print(f"[deploy] Teardown analytics Lambda: {e}")
+    try:
+        destroy_glue_catalog(glue, state)
+    except ClientError as e:
+        print(f"[deploy] Teardown Glue: {e}")
     try:
         destroy_ecs_stack(
             ecs, elbv2, ecr, logs, ec2, state, rds_sg_id=state.rds_sg_id
@@ -673,9 +856,17 @@ def run_teardown(
     except ClientError as e:
         print(f"[deploy] Teardown ECS stack: {e}")
     try:
+        destroy_datalake_bucket(s3, state)
+    except ClientError as e:
+        print(f"[deploy] Teardown datalake S3: {e}")
+    try:
         destroy_routing_graph_bucket(s3, state)
     except ClientError as e:
         print(f"[deploy] Teardown routing graph S3: {e}")
+    try:
+        destroy_predictions_table(ddb, state)
+    except ClientError as e:
+        print(f"[deploy] Teardown predictions DynamoDB: {e}")
     try:
         destroy_dynamodb_tables(ddb, state)
     except ClientError as e:
@@ -689,6 +880,41 @@ def run_teardown(
     except ClientError as e:
         print(f"[deploy] Teardown RDS: {e}")
     print("[deploy] Teardown done.")
+
+
+def _finalize_analytics(
+    *,
+    args,
+    session,
+    state: DeploymentState,
+    ordering_base_url: str,
+    deploy_region: str,
+) -> None:
+    if not args.with_analytics:
+        return
+    print("[deploy] --- Analytics ingestion (Streams -> Lambda -> S3) ---")
+    lambda_client = session.client("lambda")
+    enable_analytics_ingestion(
+        ddb=session.client("dynamodb"),
+        lambda_client=lambda_client,
+        state=state,
+        ordering_base_url=ordering_base_url,
+    )
+    if state.glue_crawler_name:
+        glue = session.client("glue")
+        try:
+            run_glue_crawler(glue, state.glue_crawler_name, wait=False)
+        except Exception as exc:
+            print(f"[deploy] Glue crawler start skipped: {exc}")
+    if args.with_predictions and not state.sagemaker_delivery_endpoint:
+        state.sagemaker_delivery_endpoint = (
+            os.environ.get("SAGEMAKER_DELIVERY_ENDPOINT") or DEFAULT_DELIVERY_ENDPOINT
+        ).strip() or None
+        print(
+            "[deploy] Prediction service deployed. Train models then set "
+            "SAGEMAKER_DELIVERY_ENDPOINT in connection.env (python -m ml.train --deploy-delivery)."
+        )
+    _snapshot_connection_env(state, ordering_base_url, region=deploy_region)
 
 
 def main() -> None:
@@ -741,7 +967,24 @@ def main() -> None:
             "Requires .env.agent with Bedrock API keys (BEDROCK_* injected on task; no Bedrock-account infra)."
         ),
     )
+    parser.add_argument(
+        "--with-analytics",
+        action="store_true",
+        help=(
+            "Provision datalake S3, DynamoDB Streams ingest Lambda, Glue catalog, and predictions table."
+        ),
+    )
+    parser.add_argument(
+        "--with-predictions",
+        action="store_true",
+        help=(
+            "Deploy prediction ECS gateway (implies --with-analytics). "
+            "Set SAGEMAKER_DELIVERY_ENDPOINT in connection.env after training."
+        ),
+    )
     args = parser.parse_args()
+    if args.with_predictions:
+        args.with_analytics = True
 
     project_root = _PROJECT_ROOT
 
@@ -757,6 +1000,12 @@ def main() -> None:
         parser.error("cannot combine --with-agent and --teardown-only")
     if args.with_agent and args.service:
         parser.error("cannot combine --with-agent and --service")
+    if args.with_analytics and args.teardown_only:
+        pass  # teardown uses connection.env state
+    if args.with_predictions and args.teardown_only:
+        pass
+    if args.with_predictions and args.service:
+        parser.error("cannot combine --with-predictions and --service")
     if args.resume:
         args.skip_teardown = True
 
@@ -796,6 +1045,7 @@ def main() -> None:
             ddb=session.client("dynamodb"),
             s3=session.client("s3"),
             state=state,
+            region=region,
         )
         if not args.keep_connection_env and CONNECTION_ENV_PATH.is_file():
             CONNECTION_ENV_PATH.unlink()
@@ -881,6 +1131,7 @@ def main() -> None:
         )
         skip_agent_dynamo = args.resume and bool(state.dynamo_agent_sessions_table)
         skip_s3 = args.resume and bool(state.routing_graph_s3_bucket)
+        skip_datalake = args.resume and bool(state.datalake_s3_bucket)
         saved_ecs_records = list(state.ecs_services)
         ecs_rebuild_only = (
             args.resume
@@ -959,6 +1210,24 @@ def main() -> None:
         upload_routing_graph_seed_if_present(s3, state.routing_graph_s3_bucket or "")
         _snapshot_connection_env(state, region=deploy_region)
 
+        if args.with_analytics:
+            if skip_datalake:
+                print("[deploy] --- Datalake (resume: existing bucket) ---")
+            else:
+                print("[deploy] --- Datalake S3 ---")
+                create_datalake_bucket(s3, suffix, deploy_region, state)
+            print("[deploy] --- Predictions DynamoDB ---")
+            create_predictions_table(ddb, suffix, state)
+            glue = session.client("glue")
+            print("[deploy] --- Glue Data Catalog ---")
+            create_glue_catalog(
+                glue,
+                suffix=suffix,
+                datalake_bucket=state.datalake_s3_bucket or "",
+                state=state,
+            )
+            _snapshot_connection_env(state, region=deploy_region)
+
         exec_arn = ensure_execution_role(iam, suffix, state)
         task_arn = ensure_task_role(iam, suffix, state)
         task_role_name = f"dijkfood-ecs-task-{suffix}"
@@ -1007,10 +1276,14 @@ def main() -> None:
                 )
             _snapshot_connection_env(state, region=deploy_region)
 
-        specs = _service_specs(project_root, with_agent=args.with_agent)
+        specs = _service_specs(
+            project_root,
+            with_agent=args.with_agent,
+            with_predictions=args.with_predictions,
+        )
 
         def _ordering_env(alb_base_url: str) -> list[dict[str, str]]:
-            return [
+            env = [
                 {"name": "DB_HOST", "value": endpoint},
                 {"name": "DB_PORT", "value": "5432"},
                 {"name": "DB_NAME", "value": DB_NAME},
@@ -1032,6 +1305,29 @@ def main() -> None:
                 "value": state.dynamo_routes_table or "",
             },
             ]
+            if args.with_predictions:
+                env.append(
+                    {
+                        "name": "PREDICTION_BASE_URL",
+                        "value": alb_base_url.rstrip("/"),
+                    }
+                )
+            if state.dynamo_predictions_table:
+                env.append(
+                    {
+                        "name": "DYNAMODB_PREDICTIONS_TABLE",
+                        "value": state.dynamo_predictions_table,
+                    }
+                )
+            return env
+
+        def _prediction_env() -> list[dict[str, str]]:
+            return build_prediction_task_environment(
+                region=deploy_region,
+                datalake_bucket=state.datalake_s3_bucket or "",
+                predictions_table=state.dynamo_predictions_table or "",
+                delivery_endpoint=state.sagemaker_delivery_endpoint,
+            )
 
         def _routing_env() -> list[dict[str, str]]:
             env = [
@@ -1101,6 +1397,8 @@ def main() -> None:
                 if rec is None:
                     if svc_id == AGENT_SERVICE_ID and args.with_agent:
                         continue
+                    if svc_id == PREDICTION_SERVICE_ID and args.with_predictions:
+                        continue
                     raise RuntimeError(
                         f"--resume: missing service_id {svc_id!r} in ECS_SERVICES_JSON"
                     )
@@ -1119,12 +1417,18 @@ def main() -> None:
                 elif svc_id == "routing":
                     env = _routing_env()
                 elif svc_id == AGENT_SERVICE_ID:
-                    env = build_agent_task_environment(
-                        region=deploy_region,
-                        alb_base_url=alb_base_url,
-                        sessions_table=state.dynamo_agent_sessions_table or "",
-                        project_root=project_root,
+                    env = _enrich_agent_env(
+                        build_agent_task_environment(
+                            region=deploy_region,
+                            alb_base_url=alb_base_url,
+                            sessions_table=state.dynamo_agent_sessions_table or "",
+                            project_root=project_root,
+                        ),
+                        state,
+                        alb_base_url,
                     )
+                elif svc_id == PREDICTION_SERVICE_ID:
+                    env = _prediction_env()
                 else:
                     env = _stub_env(svc_id)
                 create_ecs_service(
@@ -1181,12 +1485,42 @@ def main() -> None:
                     vpc_id=vpc_id,
                 )
                 _snapshot_connection_env(state, alb_base_url, region=deploy_region)
+            if args.with_predictions and not _prediction_deployed(state):
+                _provision_prediction_on_existing_alb(
+                    project_root=project_root,
+                    ecs=ecs,
+                    elbv2=elbv2,
+                    ecr=ecr,
+                    logs=logs,
+                    app_autoscaling=app_autoscaling,
+                    deploy_region=deploy_region,
+                    account_id=account_id,
+                    suffix=suffix,
+                    state=state,
+                    alb_base_url=alb_base_url,
+                    subnet_ids=subnet_ids,
+                    task_sg=task_sg,
+                    exec_arn=exec_arn,
+                    task_arn=task_arn,
+                    vpc_id=vpc_id,
+                )
+                _snapshot_connection_env(state, alb_base_url, region=deploy_region)
 
             agent_line = ""
             if args.with_agent:
                 agent_line = f"\n  Agent: {alb_base_url}/agent/v1/chat"
+            pred_line = ""
+            if args.with_predictions:
+                pred_line = f"\n  Prediction: {alb_base_url}/prediction/v1/delivery-time"
+            _finalize_analytics(
+                args=args,
+                session=session,
+                state=state,
+                ordering_base_url=alb_base_url,
+                deploy_region=deploy_region,
+            )
             print(
-                f"[deploy] All ECS services stable. ALB: {alb_base_url}{agent_line}\n"
+                f"[deploy] All ECS services stable. ALB: {alb_base_url}{agent_line}{pred_line}\n"
                 "[deploy] Run load tests manually, e.g. "
                 f"python -m simulator.orchestration.load_sim --base-url {alb_base_url}"
             )
@@ -1243,12 +1577,18 @@ def main() -> None:
                 elif svc_id == "routing":
                     env = _routing_env()
                 elif svc_id == AGENT_SERVICE_ID:
-                    env = build_agent_task_environment(
-                        region=deploy_region,
-                        alb_base_url=alb_base_url,
-                        sessions_table=state.dynamo_agent_sessions_table or "",
-                        project_root=project_root,
+                    env = _enrich_agent_env(
+                        build_agent_task_environment(
+                            region=deploy_region,
+                            alb_base_url=alb_base_url,
+                            sessions_table=state.dynamo_agent_sessions_table or "",
+                            project_root=project_root,
+                        ),
+                        state,
+                        alb_base_url,
                     )
+                elif svc_id == PREDICTION_SERVICE_ID:
+                    env = _prediction_env()
                 else:
                     env = _stub_env(svc_id)
                 svc_name = f"dijkfood-{svc_id}-{suffix}"
@@ -1292,8 +1632,18 @@ def main() -> None:
             agent_line = ""
             if args.with_agent:
                 agent_line = f"\n  Agent: http://{alb_dns}/agent/v1/chat"
+            pred_line = ""
+            if args.with_predictions:
+                pred_line = f"\n  Prediction: http://{alb_dns}/prediction/v1/delivery-time"
+            _finalize_analytics(
+                args=args,
+                session=session,
+                state=state,
+                ordering_base_url=alb_base_url,
+                deploy_region=deploy_region,
+            )
             print(
-                f"[deploy] All ECS services stable. ALB: http://{alb_dns}{agent_line}\n"
+                f"[deploy] All ECS services stable. ALB: http://{alb_dns}{agent_line}{pred_line}\n"
                 "[deploy] Run load tests manually, e.g. "
                 f"python -m simulator.orchestration.load_sim --base-url http://{alb_dns}"
             )
@@ -1345,6 +1695,7 @@ def main() -> None:
             ddb=ddb,
             s3=s3,
             state=state,
+            region=deploy_region,
         )
         print("[deploy] Done.")
         sys.exit(exit_code)

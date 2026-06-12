@@ -7,10 +7,10 @@ import logging
 import os
 from typing import Any
 
-import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
 from agent import agent_functions
+from agent.aws_clients import bedrock_runtime_client
 
 log = logging.getLogger(__name__)
 
@@ -29,14 +29,6 @@ message it returns—do not improvise an answer.
 """
 
 
-def _bedrock_region() -> str:
-    return (
-        (os.environ.get("BEDROCK_AWS_REGION") or "").strip()
-        or os.environ.get("AWS_REGION")
-        or os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
-    )
-
-
 def _model_id() -> str:
     mid = (os.environ.get("BEDROCK_MODEL_ID") or "").strip()
     if not mid:
@@ -50,27 +42,6 @@ def _max_tool_rounds() -> int:
 
 def _max_tokens() -> int:
     return max(256, int(os.environ.get("AGENT_MAX_OUTPUT_TOKENS", "2048")))
-
-
-def _bedrock_client() -> Any:
-    key = (os.environ.get("BEDROCK_AWS_ACCESS_KEY_ID") or os.environ.get("AWS_ACCESS_KEY_ID") or "").strip()
-    secret = (
-        (os.environ.get("BEDROCK_AWS_SECRET_ACCESS_KEY") or os.environ.get("AWS_SECRET_ACCESS_KEY") or "").strip()
-    )
-    token = (
-        (os.environ.get("BEDROCK_AWS_SESSION_TOKEN") or os.environ.get("AWS_SESSION_TOKEN") or "").strip()
-        or None
-    )
-    region = _bedrock_region()
-    if key and secret:
-        session = boto3.Session(
-            aws_access_key_id=key,
-            aws_secret_access_key=secret,
-            aws_session_token=token,
-            region_name=region,
-        )
-        return session.client("bedrock-runtime")
-    return boto3.client("bedrock-runtime", region_name=region)
 
 
 def _new_user_message(text: str) -> dict[str, Any]:
@@ -116,7 +87,7 @@ def run_chat(
     Append user_message, run Bedrock until end_turn or max rounds.
     Returns (reply_text, updated_messages, tools_used_summary, usage).
     """
-    client = _bedrock_client()
+    client = bedrock_runtime_client()
     model_id = _model_id()
     tools = agent_functions.list_tools_for_bedrock()
     if not tools:

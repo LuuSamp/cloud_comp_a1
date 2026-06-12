@@ -43,6 +43,15 @@ class DeploymentState:
     dynamo_routes_arn: str | None = None
     dynamo_agent_sessions_arn: str | None = None
     routing_graph_s3_bucket: str | None = None
+    datalake_s3_bucket: str | None = None
+    glue_database: str | None = None
+    glue_crawler_name: str | None = None
+    analytics_lambda_name: str | None = None
+    dynamo_predictions_table: str | None = None
+    dynamo_predictions_arn: str | None = None
+    sagemaker_delivery_endpoint: str | None = None
+    sagemaker_demand_model_name: str | None = None
+    sagemaker_anomaly_model_name: str | None = None
     agent_ui_target_group_arn: str | None = None
     agent_ui_listener_rule_arn: str | None = None
     agent_ui_url: str | None = None

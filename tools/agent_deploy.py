@@ -127,8 +127,19 @@ def build_agent_task_environment(
         "AGENT_MAX_OUTPUT_TOKENS",
         "AGENT_USAGE_BUDGET_TOKENS",
         "AGENT_USAGE_DAILY_BUDGET_TOKENS",
+        "AGENT_USAGE_HISTORY_DAYS",
     ):
         val = _agent_config(project_root, key)
         if val:
             env.append({"name": key, "value": val})
+    for key, env_key in (
+        ("DATALAKE_S3_BUCKET", "DATALAKE_S3_BUCKET"),
+        ("GLUE_DATABASE", "GLUE_DATABASE"),
+        ("PREDICTION_BASE_URL", "PREDICTION_BASE_URL"),
+    ):
+        val = (os.environ.get(env_key) or "").strip()
+        if val:
+            env.append({"name": env_key, "value": val})
+    if not any(e["name"] == "PREDICTION_BASE_URL" for e in env):
+        env.append({"name": "PREDICTION_BASE_URL", "value": base})
     return env
